@@ -1,0 +1,11 @@
+# ad.py (알파카 다이어리) 실행에 필요한 선택적 외부 라이브러리 목록
+# 설치: pip install -r requirements.txt
+#
+# 모두 optional 의존성이며, 미설치 시 관련 기능(엑셀 내보내기 / Windows 11
+# 테마 / URL 제목 자동수집)만 비활성화되고 앱 자체는 정상 실행됩니다.
+# 별도로, GUI 툴킷인 tkinter는 pip 설치 대상이 아니라 OS 패키지로 설치해야
+# 합니다 (예: macOS는 `brew install python-tk`, Ubuntu는 `apt install python3-tk`).
+
+openpyxl>=3.1.0
+sv-ttk>=2.6.0
+requests>=2.31.0

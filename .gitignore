@@ -1,0 +1,68 @@
+# 1. 파이썬 가상환경 및 패키지 캐시
+.venv/
+venv/
+ENV/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# 2. 파이썬 환경 설정 및 로컬 변수
+.env
+.venv
+pip-log.txt
+pip-delete-this-directory.txt
+unit-test-results.xml
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# 3. 개발 도구 및 에디터 설정 (VS Code, PyCharm 등)
+# VS Code
+.vscode/settings.json
+.vscode/tasks.json
+.vscode/launch.json
+.vscode/extensions.json
+.vscode/*.local.json
+
+# PyCharm / IntelliJ
+.idea/
+
+# 운영체제 생성 파일 (맥/윈도우)
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
