@@ -19,6 +19,7 @@ import threading
 import html
 import webbrowser
 import configparser
+import bisect
 import zipfile
 from datetime import datetime, date, timedelta
 import calendar
@@ -127,6 +128,41 @@ def bind_when_visible(widget, sequence, callback):
             return None
         return callback(event)
     return widget.bind(sequence, handler)
+
+
+def restore_listbox_top(listbox, old_ids, old_top, new_ids):
+    """Listbox를 지웠다가 다시 채운 뒤, 다시 그리기 전에 보던 위치로 스크롤을 되돌림.
+    (다시 그리면 스크롤이 맨 위로 초기화되고, 이후 선택 행으로 see()를 하면 그 행이 화면
+    가운데로 튀므로, 선택 행이 화면 안에 있었는데도 목록이 수 행씩 움직이는 문제가 있었음)
+
+    - old_ids/new_ids: 다시 그리기 전/후의 각 행이 어떤 항목(id)인지 (표시 순서대로)
+    - old_top: 다시 그리기 전에 맨 위에 보이던 행 번호 (Listbox.nearest(0)), 목록이 비어
+      있었다면 None
+    행 수가 같으면(순서 이동/이름 변경/단순 재그리기) 맨 위 행 번호를 그대로 쓰고, 행 수가
+    달라졌으면(추가/삭제) 맨 위에 보이던 항목의 id로 새 위치를 찾아서 보던 내용이 밀리지
+    않게 함 (그 항목이 사라졌다면 이전 행 번호를 씀). 선택 행이 화면 밖이면 호출한 쪽이
+    이어서 see()로 보이게 하면 됨."""
+    if old_top is None or not new_ids:
+        return
+    if len(new_ids) == len(old_ids):
+        top = old_top
+    else:
+        anchor = old_ids[old_top] if 0 <= old_top < len(old_ids) else None
+        top = new_ids.index(anchor) if anchor in new_ids else old_top
+    listbox.yview(max(0, min(top, len(new_ids) - 1)))
+
+
+def replace_listbox_row(listbox, index, text):
+    """Listbox의 한 행 글자만 바꿈 (전체를 다시 그리지 않음 - 스크롤/나머지 행은 그대로).
+    delete+insert를 하면 그 행의 선택 표시가 사라지고 활성(active) 항목이 한 칸 밀리므로
+    원래 상태로 되돌림."""
+    was_selected = listbox.selection_includes(index)
+    active = listbox.index("active")
+    listbox.delete(index)
+    listbox.insert(index, text)
+    if was_selected:
+        listbox.selection_set(index)
+    listbox.activate(active)
 
 
 def focus_listbox_edge(listbox, to_end):
@@ -476,15 +512,38 @@ class MemoStore:
     def load_holidays(self):
         """대한민국 공휴일 정보를 holidays.json에서 불러옴 (없거나 손상되었으면 빈 딕셔너리).
         {"YYYY-MM-DD": "공휴일 이름"} 형태이며, memos_calendar.json과 달리 앱이 이 파일에
-        쓰지는 않는 참고용 데이터임 - 최신 연도를 쓰려면 이 파일을 직접 교체/추가해야 함"""
+        쓰지는 않는 참고용 데이터임 - 최신 연도를 쓰려면 이 파일을 직접 교체/추가해야 함.
+
+        직접 편집하다 생긴 오타가 달력/목록 동작에 영향을 주지 않도록 항목마다 검증해서
+        올바른 것만 사용하고, 건너뛴 항목은 self.holiday_problems에 기록함(앱이 시작된 뒤
+        한 번 안내함). 날짜는 0이 채워진 YYYY-MM-DD 형식이고 실제로 있는 날짜여야 하며,
+        이름은 비어 있지 않은 문자열이어야 함. (strptime은 "2026-9-5"도 통과시키지만 달력은
+        "2026-09-05" 키로 찾으므로 정규식으로 자릿수까지 확인함)"""
+        self.holiday_problems = []
         if not os.path.exists(self.holiday_file):
             return {}
         try:
             with open(self.holiday_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            return data if isinstance(data, dict) else {}
-        except (json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
             return {}
+        if not isinstance(data, dict):
+            return {}
+        holidays = {}
+        for key, name in data.items():
+            if not (isinstance(key, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", key)):
+                self.holiday_problems.append(f"{key!r}: 날짜 형식이 YYYY-MM-DD가 아닙니다")
+                continue
+            try:
+                datetime.strptime(key, "%Y-%m-%d")
+            except ValueError:
+                self.holiday_problems.append(f"{key}: 존재하지 않는 날짜입니다")
+                continue
+            if not isinstance(name, str) or not name.strip():
+                self.holiday_problems.append(f"{key}: 공휴일 이름이 비어 있거나 문자열이 아닙니다")
+                continue
+            holidays[key] = name.strip()
+        return holidays
 
     def load_calendar_memos(self):
         """달력메모(memos_calendar.json)를 불러옴: {"YYYY-MM-DD": "내용", ...} 형태.
@@ -1151,28 +1210,25 @@ class GeneralMemoTab:
         self.copy_button.config(state=state)
         self.app.update_status_bar()
 
-    def update_listbox(self, preserve_scroll=False):
+    def update_listbox(self, preserve_scroll=False, top_adjust=0):
         """
-        리스트박스를 업데이트하면서 스크롤 위치를 유지할 수 있는 옵션 추가
+        리스트박스를 다시 그림. 다시 그리면 스크롤이 맨 위로 초기화되므로 필요하면 보던 위치를 유지함.
 
         Args:
-            preserve_scroll: True이면 현재 스크롤 위치를 유지
+            preserve_scroll: True이면 다시 그리기 전에 맨 위에 보이던 행 번호를 기억했다가
+                그 위치로 되돌림. (예전에는 스크롤 비율로 되돌렸는데, 메모가 추가/삭제되어
+                전체 행 수가 바뀌면 비율이 어긋나 엉뚱한 위치로 갔으므로 행 번호 기준으로 함)
+            top_adjust: 보던 위치보다 앞쪽 행이 추가/삭제되어 행 번호가 밀린 만큼의 보정값
+                (예: 화면 위쪽에 있던 행을 삭제했다면 -1)
         """
-        if preserve_scroll:
-            try:
-                scroll_position = self.listbox.yview()
-            except Exception:
-                scroll_position = None
+        top = self.listbox.nearest(0) if (preserve_scroll and self.listbox.size()) else None
 
         self.listbox.delete(0, tk.END)
         for memo in self.memos:
             self.listbox.insert(tk.END, memo["title"])
 
-        if preserve_scroll and scroll_position:
-            try:
-                self.listbox.yview_moveto(scroll_position[0])
-            except Exception:
-                pass
+        if top is not None and self.listbox.size():
+            self.listbox.yview(max(0, min(top + top_adjust, self.listbox.size() - 1)))
 
         self.app.update_status_bar()
 
@@ -1193,10 +1249,11 @@ class GeneralMemoTab:
         new_memo = {"title": "새 메모", "content": ""}
         insert_pos = self.current_index + 1 if self.current_index != -1 else len(self.memos)
         self.memos.insert(insert_pos, new_memo)
-        self.update_listbox()
+        self.update_listbox(preserve_scroll=True)
         self.listbox.selection_clear(0, tk.END)
         self.listbox.selection_set(insert_pos)
         self.listbox.activate(insert_pos)
+        self.listbox.see(insert_pos)  # 새 메모가 화면 밖(예: 맨 끝에 추가)이면 보이는 위치로 이동
         self.on_memo_select(None)
         self.app.save_memos()
 
@@ -1205,12 +1262,21 @@ class GeneralMemoTab:
             messagebox.showwarning("경고", "삭제할 메모를 선택하세요.")
             return
         if messagebox.askyesno("확인", "선택한 메모를 제거하시겠습니까?"):
-            del self.memos[self.current_index]
+            removed_index = self.current_index
+            top_before = self.listbox.nearest(0)
+            del self.memos[removed_index]
             self.current_index = -1
             self.title_entry.delete(0, tk.END)
             self.content_text.delete("1.0", tk.END)
             self.toggle_right_panel(False)
-            self.update_listbox()
+            # 화면 위쪽(보이는 영역보다 앞)의 행을 지웠다면 아래 행들이 한 칸씩 올라오므로
+            # 보던 첫 행이 그대로 맨 위에 오도록 한 칸 보정함
+            self.update_listbox(preserve_scroll=True,
+                                top_adjust=-1 if removed_index < top_before else 0)
+            if self.memos:
+                # 다시 그리면 활성(active) 항목이 맨 위(0번)로 초기화되어, 이어서 ↑↓를
+                # 누르면 목록 맨 위 근처로 튀므로 삭제한 자리로 되돌림 (선택은 하지 않음)
+                self.listbox.activate(min(removed_index, len(self.memos) - 1))
             self.app.save_memos()
 
     def move_memo_up(self):
@@ -1297,6 +1363,9 @@ class GeneralMemoTab:
             self.listbox.delete(self.current_index)
             self.listbox.insert(self.current_index, title)
             self.listbox.selection_set(self.current_index)
+            # delete+insert 때문에 활성(active) 항목이 한 칸 뒤로 밀리면, 이후 목록에서
+            # ↓를 눌렀을 때 한 행을 건너뛰므로 편집 중인 행으로 되돌림
+            self.listbox.activate(self.current_index)
 
         self.app._debounced_save("memos", self.app.save_memos)
         self.app.update_status_bar()
@@ -1883,9 +1952,11 @@ class CalendarMemoTab:
         편집 중인 날짜는 바꾸지 않는다.)"""
         self.on_calendar_date_click(self._today_str())
 
-    def on_calendar_date_click(self, date_key):
+    def on_calendar_date_click(self, date_key, redraw_list=True):
         """달력의 날짜 칸 클릭: 해당 날짜를 선택하고 오른쪽에 그 날짜의 메모 내용을 표시.
-        (다른 달/해의 흐린 날짜를 클릭한 경우 그 달/해로 이동도 함께 처리)"""
+        (다른 달/해의 흐린 날짜를 클릭한 경우 그 달/해로 이동도 함께 처리)
+        redraw_list=False는 [목록보기]에서 행을 직접 선택해 호출한 경우에 씀: 그 행은 이미
+        선택되어 있고 메모 유무도 바뀌지 않으므로 목록을 다시 그릴 필요가 없음."""
         try:
             y, m, _ = date_key.split("-")
             self.cal_year, self.cal_month = int(y), int(m)
@@ -1898,7 +1969,7 @@ class CalendarMemoTab:
         self.date_content_text.delete("1.0", tk.END)
         self.date_content_text.insert("1.0", self.calendar_memos.get(date_key, ""))
         self._update_remove_date_memo_button_state()
-        self._refresh_calendar_views()
+        self._refresh_calendar_views(redraw_list=redraw_list)
         self.app.update_status_bar()
 
     def go_to_adjacent_memo_date(self, direction):
@@ -1919,15 +1990,18 @@ class CalendarMemoTab:
             target = min(candidates)
         self.on_calendar_date_click(target)
 
-    def _refresh_calendar_views(self):
+    def _refresh_calendar_views(self, redraw_list=True):
         """현재 보이는 달력 뷰만 즉시 다시 그리고, 다른 쪽들은 다음에 그 탭으로
-        전환될 때 그리도록 표시만 해둔다(불필요한 위젯 재생성을 피해 반응성을 유지)."""
+        전환될 때 그리도록 표시만 해둔다(불필요한 위젯 재생성을 피해 반응성을 유지).
+        redraw_list=False면 [목록보기]가 보이는 중이어도 목록은 다시 그리지 않음
+        (다른 뷰를 '나중에 그릴 것'으로 표시하는 일은 그대로 함)."""
         if self._is_year_view_active():
             self.render_year_view()
             self._month_view_stale = True
             self._list_view_stale = True
         elif self._is_list_view_active():
-            self._refresh_date_list()
+            if redraw_list:
+                self._refresh_date_list()
             self._month_view_stale = True
             self._year_view_stale = True
         else:
@@ -1984,6 +2058,15 @@ class CalendarMemoTab:
         """[목록보기]의 날짜 목록을 현재 메모가 있는 날짜만, 날짜순으로 다시 그림.
         [공휴일 표시] 체크박스가 켜져 있으면 holidays.json에 등록된 날짜 옆에
         "| 공휴일이름"을 덧붙임 (예: "2026-09-25 (금) | 추석")."""
+        # 다시 그리면 Listbox의 스크롤이 맨 위로 초기화되므로, 맨 위에 보이던 날짜를
+        # 기억해 두었다가 다시 그린 뒤 같은 날짜(없으면 그 다음 날짜)가 맨 위에 오게
+        # 되돌림. 행 번호가 아니라 날짜로 기억하므로, 메모가 추가/삭제되어 행 수가
+        # 바뀌어도 보던 위치가 밀리지 않음.
+        top_key = None
+        if self.date_listbox.size() and self._date_list_keys:
+            top_idx = self.date_listbox.nearest(0)
+            if 0 <= top_idx < len(self._date_list_keys):
+                top_key = self._date_list_keys[top_idx]
         self.date_listbox.delete(0, tk.END)
         self._date_list_keys = sorted(self.calendar_memos.keys())
         weekdays_kr = ["월", "화", "수", "목", "금", "토", "일"]
@@ -1999,6 +2082,9 @@ class CalendarMemoTab:
                 if holiday_name:
                     label = f"{label} | {holiday_name}"
             self.date_listbox.insert(tk.END, label)
+        if top_key is not None and self._date_list_keys:
+            self.date_listbox.yview(min(bisect.bisect_left(self._date_list_keys, top_key),
+                                        len(self._date_list_keys) - 1))
         if self.selected_date in self._date_list_keys:
             idx = self._date_list_keys.index(self.selected_date)
             self.date_listbox.selection_set(idx)
@@ -2029,7 +2115,9 @@ class CalendarMemoTab:
         if 0 <= idx < len(self._date_list_keys):
             date_key = self._date_list_keys[idx]
             if date_key != self.selected_date:
-                self.on_calendar_date_click(date_key)
+                # 목록에서 직접 고른 행이므로 목록은 다시 그리지 않음 (다시 그리면 스크롤이
+                # 맨 위로 초기화된 뒤 선택 행이 화면 가운데로 튀는 현상이 생김)
+                self.on_calendar_date_click(date_key, redraw_list=False)
 
     def _on_date_list_delete(self, event=None):
         """날짜 목록에 포커스가 있을 때 Delete: 목록에서 선택한 날짜의 메모를 제거함.
@@ -3338,6 +3426,7 @@ class ChecklistTab:
         after_id = self._get_selected_item_id()
         item = self._add_item_data(fid, content=raw, after_id=after_id)
         if item:
+            self._update_folder_label(fid)  # 폴더의 항목 수 (N) 갱신 (목록 전체를 다시 그리지 않음)
             self._refresh_items(select_item_id=item["id"])
             self.app.show_status_message("항목을 추가했습니다.")
         self.add_entry.delete(0, tk.END)
@@ -3363,13 +3452,29 @@ class ChecklistTab:
             select_index = 0
         self._render_folder_list(ordered_ids, select_index=select_index, select_item_id=select_item_id)
 
+    @staticmethod
+    def _folder_label(folder):
+        return f"  {folder['name']}  ({len(folder['items'])})"
+
+    def _update_folder_label(self, fid):
+        """항목을 추가/삭제해 폴더의 항목 수 표시 (N)만 바뀐 경우, 폴더 목록 전체를 다시
+        그리지 않고 그 폴더의 행 글자만 갱신함 (다시 그리면 목록 스크롤이 튐)"""
+        folder = self._get_folder(fid)
+        if folder and fid in self._folder_id_by_index:
+            replace_listbox_row(self.folder_listbox, self._folder_id_by_index.index(fid),
+                                self._folder_label(folder))
+
     def _render_folder_list(self, ordered_ids, select_index=None, select_item_id=None):
+        # 다시 그리면 스크롤이 맨 위로 초기화되므로, 보던 위치를 기억해 두었다가 되돌림
+        old_ids = self._folder_id_by_index
+        old_top = self.folder_listbox.nearest(0) if self.folder_listbox.size() else None
         self.folder_listbox.delete(0, tk.END)
         for fid in ordered_ids:
             folder = self._get_folder(fid)
             if folder:
-                self.folder_listbox.insert(tk.END, f"  {folder['name']}  ({len(folder['items'])})")
+                self.folder_listbox.insert(tk.END, self._folder_label(folder))
         self._folder_id_by_index = list(ordered_ids)
+        restore_listbox_top(self.folder_listbox, old_ids, old_top, self._folder_id_by_index)
         if select_index is not None and 0 <= select_index < len(self._folder_id_by_index):
             self.folder_listbox.selection_set(select_index)
             self.folder_listbox.activate(select_index)
@@ -3548,7 +3653,9 @@ class ChecklistTab:
             return
         if messagebox.askyesno("항목 삭제", "선택한 항목을 삭제하시겠습니까?", parent=self.app.root):
             self._delete_item_data(fid, item_id)
-            self._refresh_folders()
+            # 폴더 목록 전체가 아니라 그 폴더의 항목 수 (N)와 오른쪽 항목 목록만 갱신함
+            self._update_folder_label(fid)
+            self._refresh_items()
             self.app.show_status_message("항목을 삭제했습니다.")
 
     def _show_context_menu(self, event):
@@ -4217,7 +4324,9 @@ class CollectionTab:
 
         def on_save(title, url, memo):
             created = self._add_item_data(cid, title=title, url=url, memo=memo, item_id=new_id, after_id=after_id)
-            self._refresh_collections(select_item_id=new_id if created else None)
+            if created:
+                self._update_collection_label(cid)  # 컬렉션의 항목 수 (N)만 갱신 (목록 전체를 다시 그리지 않음)
+                self._refresh_items(select_item_id=new_id)
             self.app.show_status_message("항목을 추가했습니다." if created else "추가를 취소했습니다.")
 
         EditItemDialog(self.app.root, {"id": new_id, "title": "", "url": "", "memo": ""},
@@ -4309,7 +4418,8 @@ class CollectionTab:
             after_id = self._get_selected_item_id()
             item = self._add_item_data(cid, title=raw, url="", memo="", after_id=after_id)
             if item:
-                self._refresh_collections(select_item_id=item["id"])
+                self._update_collection_label(cid)
+                self._refresh_items(select_item_id=item["id"])
                 self.app.show_status_message("메모를 추가했습니다.")
         self.add_entry.delete(0, tk.END)
         return "break"
@@ -4325,7 +4435,8 @@ class CollectionTab:
         item = self._add_item_data(cid, title=url, url=url, memo="", after_id=after_id)
         if not item:
             return
-        self._refresh_collections(select_item_id=item["id"])
+        self._update_collection_label(cid)
+        self._refresh_items(select_item_id=item["id"])
         request_id = item["id"]
         self._pending_fetches[request_id] = cid
         self.app.show_status_message(f"제목을 가져오는 중입니다... ({url})")
@@ -4360,8 +4471,9 @@ class CollectionTab:
                     continue
                 if msg.get("title"):
                     self._update_item_data(cid, request_id, title=msg["title"])
-                    if self._get_selected_collection_id() == cid:
-                        self._refresh_items()
+                    # 목록 전체를 다시 그리면 보고 있던 항목의 선택이 풀리고, 편집 중이던
+                    # 인라인 편집이 강제로 확정되므로 그 항목의 행만 갱신함
+                    self._update_item_row(cid, request_id)
                     self.app.show_status_message(f"제목을 가져왔습니다: {msg['title']}")
                 elif msg.get("error"):
                     self.app.show_status_message(f"제목 가져오기 실패: {msg['error']}")
@@ -4394,14 +4506,30 @@ class CollectionTab:
             select_index = 0
         self._render_collection_list(ordered_ids, select_index=select_index, select_item_id=select_item_id)
 
+    @staticmethod
+    def _collection_label(col):
+        return f"  {col['name']}  ({len(col['items'])})"
+
+    def _update_collection_label(self, cid):
+        """항목을 추가/삭제해 컬렉션의 항목 수 표시 (N)만 바뀐 경우, 컬렉션 목록 전체를 다시
+        그리지 않고 그 컬렉션의 행 글자만 갱신함 (다시 그리면 목록 스크롤이 튐)"""
+        col = self._get_collection(cid)
+        if col and cid in self._collection_id_by_index:
+            replace_listbox_row(self.collection_listbox, self._collection_id_by_index.index(cid),
+                                self._collection_label(col))
+
     def _render_collection_list(self, ordered_ids, select_index=None, select_item_id=None):
+        # 다시 그리면 스크롤이 맨 위로 초기화되므로, 보던 위치를 기억해 두었다가 되돌림
+        old_ids = self._collection_id_by_index
+        old_top = self.collection_listbox.nearest(0) if self.collection_listbox.size() else None
         self.collection_listbox.delete(0, tk.END)
         for cid in ordered_ids:
             col = self._get_collection(cid)
             if not col:
                 continue
-            self.collection_listbox.insert(tk.END, f"  {col['name']}  ({len(col['items'])})")
+            self.collection_listbox.insert(tk.END, self._collection_label(col))
         self._collection_id_by_index = list(ordered_ids)
+        restore_listbox_top(self.collection_listbox, old_ids, old_top, self._collection_id_by_index)
         if select_index is not None and 0 <= select_index < len(self._collection_id_by_index):
             self.collection_listbox.selection_set(select_index)
             # selection_set()은 "선택 표시"만 하고, 방향키 탐색의 기준이 되는
@@ -4546,6 +4674,26 @@ class CollectionTab:
         return "\n".join((line("제목", item.get("title")), line("URL", item.get("url")),
                           line("메모", item.get("memo"))))
 
+    @staticmethod
+    def _item_row_values(item):
+        """항목 목록(Treeview)의 한 행에 표시할 (제목, URL, 메모 미리보기)"""
+        memo_preview = (item.get("memo") or "").replace("\n", " ").strip()
+        if len(memo_preview) > 50:
+            memo_preview = memo_preview[:50] + "…"
+        title_display = item.get("title", "")
+        if item.get("url"):
+            title_display = f"🔗 {title_display}" if title_display else f"🔗 {item['url']}"
+        return (title_display, item.get("url", ""), memo_preview)
+
+    def _update_item_row(self, cid, item_id):
+        """지금 보고 있는 컬렉션의 항목 하나의 표시만 새 데이터로 바꿈 (목록을 다시 그리지
+        않으므로 선택/스크롤/편집 중인 인라인 편집이 그대로 유지됨)"""
+        if cid != self._get_selected_collection_id() or not self.items_tree.exists(item_id):
+            return
+        item = self._find_item(cid, item_id)
+        if item:
+            self.items_tree.item(item_id, values=self._item_row_values(item))
+
     def _refresh_items(self, select_item_id=None):
         self._commit_inline_edit()
         self._hide_link_tooltip()
@@ -4555,16 +4703,7 @@ class CollectionTab:
         col = self._get_collection(cid) if cid else None
         if col:
             for item in col["items"]:
-                memo_preview = (item.get("memo") or "").replace("\n", " ").strip()
-                if len(memo_preview) > 50:
-                    memo_preview = memo_preview[:50] + "…"
-                title_display = item.get("title", "")
-                if item.get("url"):
-                    title_display = f"🔗 {title_display}" if title_display else f"🔗 {item['url']}"
-                self.items_tree.insert(
-                    "", "end", iid=item["id"],
-                    values=(title_display, item.get("url", ""), memo_preview),
-                )
+                self.items_tree.insert("", "end", iid=item["id"], values=self._item_row_values(item))
             if select_item_id and self.items_tree.exists(select_item_id):
                 self.items_tree.selection_set(select_item_id)
                 # selection_set()만으로는 방향키 탐색 기준이 되는 "포커스(focus)" 항목이
@@ -4660,7 +4799,7 @@ class CollectionTab:
 
         def on_save(title, url, memo):
             self._update_item_data(cid, item_id, title=title, url=url, memo=memo)
-            self._refresh_items()
+            self._refresh_items(select_item_id=item_id)  # 저장한 항목의 선택을 유지
             self.app.show_status_message("항목을 수정했습니다.")
 
         EditItemDialog(self.app.root, item, on_save, self._content_font, self._current_colors)
@@ -4672,7 +4811,9 @@ class CollectionTab:
             return
         if messagebox.askyesno("항목 삭제", "선택한 항목을 삭제하시겠습니까?", parent=self.app.root):
             self._delete_item_data(cid, item_id)
-            self._refresh_collections()
+            # 컬렉션 목록 전체가 아니라 그 컬렉션의 항목 수 (N)와 오른쪽 항목 목록만 갱신함
+            self._update_collection_label(cid)
+            self._refresh_items()
             self.app.show_status_message("항목을 삭제했습니다.")
 
     def _show_context_menu(self, event):
@@ -5077,6 +5218,7 @@ class MemoApp:
         # (설정창에서 같은 테마를 다시 '저장'하면 정상으로 보이는 것과 동일한 현상).
         # 창이 완전히 그려진 뒤 테마를 한 번 더 적용해 이를 자동으로 바로잡는다.
         self.root.after(150, self._reapply_theme_on_startup)
+        self.root.after(400, self._notify_holiday_problems)
 
     # ---- 저장/자동저장 (MemoStore를 감싸는 얇은 래퍼: 실패 시 알림 대상 key 관리) ----
 
@@ -5660,6 +5802,20 @@ class MemoApp:
         if on_activated:
             on_activated()
         self.update_status_bar()
+
+    def _notify_holiday_problems(self):
+        """holidays.json에서 형식이 맞지 않아 건너뛴 항목이 있으면 시작 후 한 번 안내함.
+        (조용히 빠뜨리면 공휴일이 왜 안 보이는지 알기 어렵기 때문. 나머지 항목은 정상 사용됨)"""
+        problems = getattr(self.store, "holiday_problems", [])
+        if not problems:
+            return
+        shown = problems[:5]
+        message = (f"holidays.json에서 형식이 맞지 않는 항목 {len(problems)}개를 건너뛰었습니다.\n"
+                   "나머지 공휴일은 정상적으로 사용됩니다.\n\n· " + "\n· ".join(shown))
+        if len(problems) > len(shown):
+            message += f"\n· ... 외 {len(problems) - len(shown)}개"
+        message += "\n\n날짜는 \"2026-09-25\"처럼 YYYY-MM-DD 형식으로, 이름은 문자열로 적어주세요."
+        messagebox.showwarning("공휴일 파일 확인", message, parent=self.root)
 
     def _reapply_theme_on_startup(self):
         """창이 완전히 표시된 뒤 테마를 다시 한번 적용해, 시작 시 일부 위젯이
