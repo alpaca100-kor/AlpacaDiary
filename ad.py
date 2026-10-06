@@ -1,8 +1,7 @@
 """
 알파카 다이어리 (Alpaca Diary) — ad.py
 
-'알파카 메모장'(일반메모/달력메모)에 '엣지 컬렉션 매니저'의 핵심 기능을 "컬렉션" 탭으로
-통합하고, "체크리스트" 탭(쇼핑리스트/할일 등)을 더한 버전. 네 개의 탭이 각자 독립적인
+일반메모 / 달력메모 / 체크리스트 / 컬렉션 네 개의 탭으로 이루어진 메모 앱. 각 탭은 독립적인
 데이터 파일(memos.json / memos_calendar.json / checklists.json / collections.json)을 갖고,
 공통 UI 요소(글꼴/테마/단축키 등)는 공유한다.
 """
@@ -20,7 +19,9 @@ import html
 import webbrowser
 import configparser
 import bisect
+import shutil
 import zipfile
+from urllib.parse import urlparse
 from datetime import datetime, date, timedelta
 import calendar
 
@@ -53,13 +54,11 @@ def resource_path(relative_path):
 
 
 def get_app_dir():
-    """실행 파일(exe) 또는 스크립트가 실제로 위치한 폴더 경로를 반환.
+    """실행 파일(exe) 또는 스크립트가 있는 폴더 경로를 반환함.
 
-    resource_path()의 sys._MEIPASS는 PyInstaller onefile 실행 시 임시로 압축 해제되는
-    폴더라 프로그램 종료 후 사라지므로, memos.json/settings.ini처럼 계속 남아있어야 하는
-    사용자 데이터 파일 경로에는 사용하면 안 됨. 이 함수는 exe(또는 .py) 자체가 있는
-    폴더를 반환해서, 실행 시 현재 작업 디렉터리(cwd)가 무엇이든 관계없이 항상 같은
-    위치에 데이터를 저장/로드하도록 함.
+    사용자 데이터(memos.json, settings.ini 등)는 실행할 때의 작업 디렉터리(cwd)와 상관없이
+    항상 같은 위치에 저장해야 하므로 이 함수를 씀. resource_path()의 sys._MEIPASS는
+    onefile 실행 시 임시 폴더라 종료하면 사라지므로 데이터 경로에는 쓰면 안 됨.
     """
     if getattr(sys, "frozen", False):
         # PyInstaller로 빌드된 exe: exe 파일이 있는 폴더
@@ -69,14 +68,9 @@ def get_app_dir():
 
 
 def set_windows_app_id(app_id="alpaca.diary"):
-    """Windows 작업표시줄이 이 프로그램을 python/pythonw나 다른 프로그램과 묶지 않고
-    독립된 앱으로 인식하도록 AppUserModelID를 지정함. 창에 지정한 아이콘이
-    작업표시줄에도 제대로 표시되게 하는 데 필요하며, 반드시 tk.Tk()를 만들기 전에
-    호출해야 함. Windows가 아니거나 API가 없으면 조용히 무시함.
-
-    주의: 기존 "알파카 메모장"(alpaca.notepad)에서 이 값을 바꿨으므로, Windows는
-    이 프로그램을 이전과 다른 앱으로 인식한다. 작업표시줄에 예전 아이콘을 고정해
-    두었던 사용자는 새로 빌드한 뒤 다시 고정해야 할 수 있음."""
+    """Windows 작업표시줄이 이 프로그램을 python/pythonw 등 다른 프로그램과 묶지 않고
+    독립된 앱으로 인식하도록 AppUserModelID를 지정함. 창 아이콘이 작업표시줄에도 제대로
+    표시되려면 tk.Tk()를 만들기 전에 호출해야 함. Windows가 아니거나 API가 없으면 조용히 무시함."""
     if sys.platform != "win32":
         return
     try:
@@ -102,6 +96,57 @@ def short_id():
     return str(uuid.uuid4())
 
 
+# MemoStore._read_json이 "읽을 데이터가 없음(파일 없음/빈 파일/손상)"을 알리는 표지.
+# None은 JSON의 null과 구분되지 않으므로 별도 객체를 씀
+NO_DATA = object()
+
+_DATE_KEY_RE = re.compile(r"(\d{4})-(\d{1,2})-(\d{1,2})")
+
+
+def normalize_date_key(raw):
+    """날짜 문자열을 달력이 조회하는 "YYYY-MM-DD"(0 채움) 형태로 바꿔 반환함. "2026-9-5"도
+    "2026-09-05"로 바로잡음 (strptime은 0이 빠진 형태도 통과시키므로 쓰지 않음).
+    문자열이 아니거나, 형식이 다르거나, 없는 날짜이거나, 달력이 지원하는 연도
+    (CAL_MIN_YEAR~CAL_MAX_YEAR) 밖이면 None."""
+    if not isinstance(raw, str):
+        return None
+    m = _DATE_KEY_RE.fullmatch(raw.strip())
+    if not m:
+        return None
+    year, month, day = (int(g) for g in m.groups())
+    if not (CAL_MIN_YEAR <= year <= CAL_MAX_YEAR):
+        return None
+    try:
+        date(year, month, day)
+    except ValueError:
+        return None
+    return f"{year:04d}-{month:02d}-{day:02d}"
+
+
+def normalize_calendar_memos(data):
+    """{날짜: 내용} 딕셔너리의 날짜 키를 정규화함. (정규화된 딕셔너리, 건너뛴 키 목록)을 반환.
+    날짜가 올바르지 않거나 내용이 문자열이 아닌 항목은 건너뛰고, 정규화한 날짜가 겹치는 항목
+    ("2026-9-5"와 "2026-09-05")은 내용을 합쳐 어느 쪽도 잃지 않게 함."""
+    result, skipped = {}, []
+    for key, content in data.items():
+        norm = normalize_date_key(key)
+        if norm is None or not isinstance(content, str):
+            skipped.append(key)
+            continue
+        result[norm] = f"{result[norm]}\n\n{content}" if norm in result else content
+    return result, skipped
+
+
+def is_web_url(url):
+    """브라우저로 열어도 되는 http/https 주소인지. file://, javascript: 같은 다른 스킴은
+    OS 기본 프로그램으로 넘어갈 수 있어 열지 않음"""
+    try:
+        parsed = urlparse(url.strip())
+    except (ValueError, AttributeError):
+        return False
+    return parsed.scheme.lower() in ("http", "https") and bool(parsed.netloc)
+
+
 class EmptyTransferFileError(Exception):
     """가져오기/복원할 JSON 파일이 비어 있을 때 (구조 오류와 다른 안내문을 보여주기 위함)"""
 
@@ -110,18 +155,14 @@ def bind_when_visible(widget, sequence, callback):
     """widget.bind(sequence, callback)과 같지만, 그 위젯이 화면에서 사라져 있을 때는
     callback을 실행하지 않음.
 
-    탭/서브탭 전환(Ctrl+Tab, Alt+M/Y/L 등)은 키보드 포커스를 옮기지 않아서, 화면에서
-    사라진 목록/입력창이 포커스를 그대로 갖고 있고 키 입력도 계속 거기로 전달됨. 가드가
-    없으면 다른 탭을 보고 있는데도 PageUp/PageDown으로 안 보이는 목록의 순서가 바뀌거나
-    Delete로 안 보이는 항목의 삭제 확인창이 뜨는 문제가 생김.
+    탭/서브탭을 전환해도 키보드 포커스는 옮겨지지 않아서, 화면에서 사라진 목록/입력창이
+    포커스를 그대로 갖고 있고 키 입력도 계속 거기로 전달됨. 가드가 없으면 다른 탭을 보는
+    중에 PageUp/PageDown이나 Delete가 안 보이는 목록에 적용됨.
 
-    화면에 보이지 않으면 None을 반환해서, 그 위젯에 포커스가 없는 것처럼 키를 그대로
-    통과시킴. (\"break\"를 반환하면 root에 걸린 전역 단축키까지 막히기 때문 - 예: 달력메모
-    탭의 PageUp/PageDown 이전/다음 메모 이동은 root 바인딩이 처리함)
-    화면에 보이는 동안은 callback을 그대로 호출하고 그 반환값(\"break\" 등)도 그대로 돌려줌.
-
-    winfo_viewable()은 위젯 자신과 모든 부모가 map된 상태일 때만 True라서, 노트북에서
-    다른 탭으로 가려진 위젯은 False가 됨.
+    안 보일 때는 None을 반환해 키를 그대로 통과시킴("break"를 반환하면 root에 걸린 전역
+    단축키까지 막힘). 보이는 동안은 callback의 반환값("break" 등)을 그대로 돌려줌.
+    winfo_viewable()은 위젯과 모든 부모가 map된 상태일 때만 True라서, 노트북에서 다른 탭에
+    가려진 위젯은 False가 됨.
     """
     def handler(event):
         if not widget.winfo_viewable():
@@ -132,8 +173,7 @@ def bind_when_visible(widget, sequence, callback):
 
 def restore_listbox_top(listbox, old_ids, old_top, new_ids):
     """Listbox를 지웠다가 다시 채운 뒤, 다시 그리기 전에 보던 위치로 스크롤을 되돌림.
-    (다시 그리면 스크롤이 맨 위로 초기화되고, 이후 선택 행으로 see()를 하면 그 행이 화면
-    가운데로 튀므로, 선택 행이 화면 안에 있었는데도 목록이 수 행씩 움직이는 문제가 있었음)
+    (다시 그리면 스크롤이 맨 위로 초기화됨)
 
     - old_ids/new_ids: 다시 그리기 전/후의 각 행이 어떤 항목(id)인지 (표시 순서대로)
     - old_top: 다시 그리기 전에 맨 위에 보이던 행 번호 (Listbox.nearest(0)), 목록이 비어
@@ -166,17 +206,15 @@ def replace_listbox_row(listbox, index, text):
 
 
 def focus_listbox_edge(listbox, to_end):
-    """Home/End 키용: Listbox의 첫 번째(to_end=False) 또는 마지막(to_end=True) 항목으로
-    포커스를 옮김. 그 항목을 선택하고, 방향키 탐색의 기준이 되는 활성(active) 항목으로
-    지정하고, 화면에 보이도록 스크롤함. 항목이 없으면 아무 것도 하지 않음. 이동한
-    인덱스(항목이 없으면 None)를 반환함.
+    """Home/End 키용: Listbox의 첫 번째(to_end=False) 또는 마지막(to_end=True) 항목을
+    선택하고, 방향키 탐색의 기준인 활성(active) 항목으로 지정하고, 화면에 보이도록
+    스크롤함. 항목이 없으면 아무 것도 하지 않음. 이동한 인덱스(없으면 None)를 반환함.
 
-    - Listbox의 기본 Home/End는 가로 스크롤(xview)일 뿐이라 선택은 그대로임. 그래서 이
-      함수를 부르는 키 핸들러는 "break"를 반환해 그 기본 동작을 막아야 함.
-    - selection_set()/activate()는 <<ListboxSelect>> 이벤트를 만들지 않음. 방향키(↑↓)로
-      옮길 때와 똑같이 각 탭이 이 이벤트에 걸어둔 처리(오른쪽 항목 목록/편집창 갱신
-      등)가 실행되도록, 선택이 실제로 바뀐 경우에 한해 이벤트를 직접 발생시킴 (이미 그
-      항목이 선택돼 있으면 오른쪽 목록을 쓸데없이 다시 그리지 않음).
+    - Listbox의 기본 Home/End는 가로 스크롤일 뿐이므로, 이 함수를 부르는 키 핸들러는
+      "break"를 반환해 기본 동작을 막아야 함.
+    - selection_set()/activate()는 <<ListboxSelect>>를 발생시키지 않음. 방향키로 옮길 때와
+      같은 처리(오른쪽 목록/편집창 갱신 등)가 실행되도록, 선택이 실제로 바뀐 경우에만
+      이벤트를 직접 발생시킴.
     - 화면에서 사라진 목록에서는 동작하지 않아야 하므로, 키 바인딩은 bind_when_visible로
       거는 것을 전제로 함.
     """
@@ -196,15 +234,13 @@ def focus_listbox_edge(listbox, to_end):
 
 def focus_tree_edge(tree, to_end):
     """Home/End 키용: Treeview의 첫 번째(to_end=False) 또는 마지막(to_end=True) 항목을
-    선택하고 포커스 항목으로 지정한 뒤 화면에 보이도록 스크롤함. 항목이 없으면 아무
-    것도 하지 않음. 이동한 항목 id(항목이 없으면 None)를 반환함.
+    선택하고 포커스 항목으로 지정한 뒤 화면에 보이도록 스크롤함. 항목이 없으면 아무 것도
+    하지 않음. 이동한 항목 id(없으면 None)를 반환함.
 
-    Treeview는 방향키 탐색의 기준이 "선택(selection)"이 아니라 "포커스(focus)" 항목이라
-    focus()까지 지정해야 이후 ↑↓가 그 위치에서 이어짐. (<<TreeviewSelect>>는
-    selection_set()이 선택을 바꿀 때 Tk가 알아서 발생시키므로 따로 만들 필요 없음.)
-    Tk 8.6의 Treeview에는 Home/End 기본 동작이 없지만, 키 핸들러는 일관되게 "break"를
-    반환함.
-    focus_listbox_edge와 마찬가지로 키 바인딩은 bind_when_visible로 거는 것을 전제로 함.
+    Treeview는 방향키 탐색의 기준이 선택이 아니라 포커스(focus) 항목이라 focus()까지
+    지정해야 이후 ↑↓가 그 위치에서 이어짐. (<<TreeviewSelect>>는 selection_set()이 선택을
+    바꿀 때 Tk가 발생시킴.) Treeview에는 기본 Home/End 동작이 없지만 키 핸들러는 일관되게
+    "break"를 반환함. 키 바인딩은 focus_listbox_edge와 같이 bind_when_visible로 건다.
     """
     children = tree.get_children()
     if not children:
@@ -216,21 +252,20 @@ def focus_tree_edge(tree, to_end):
     return target
 
 
-# 일반 UI 라벨/입력창에 쓰는 공통 글꼴. 사용자가 설정으로 바꾸는 대상이 아니라
-# (메모 "내용"의 글꼴만 설정 가능 - content_font) 실행 중 값이 바뀌지 않으므로
-# 인스턴스 속성이 아닌 모듈 상수로 둠
+# 일반 UI 라벨/입력창에 쓰는 공통 글꼴. 사용자 설정 대상이 아니고(설정 가능한 것은
+# 메모 내용 글꼴 content_font뿐) 실행 중 바뀌지 않으므로 모듈 상수로 둠
 UI_FONT = ("맑은 고딕", 12)
 
-# 다크/라이트 테마별 색상 팔레트 (sv_ttk 패키지의 실제 팔레트 값 기준)
-# ttk가 직접 테마를 입히지 못하는 Listbox/Text/Treeview 인라인편집 위젯에 수동으로
-# 적용하기 위함
+# 본문 글꼴 크기 허용 범위 (글꼴 설정창 입력 검사와 settings.ini 로드에서 함께 사용)
+FONT_SIZE_MIN = 8
+FONT_SIZE_MAX = 72
+
 # 빠른 입력(Alt+1~Alt+0) 슬롯 키 순서: 1,2,...,9,0
 QUICK_INPUT_KEYS = [str(i) for i in range(1, 10)] + ["0"]
 
-# 실시간 자동저장 디바운스 지연시간(ms) - 이 시간 안에 새 키 입력이 있으면
-# 저장을 다시 미루고, 입력이 멈추고 이 시간이 지나야 실제로 디스크에 씀
-# (컬렉션 탭은 실시간 타이핑 저장이 아니라 항목 추가/삭제/편집창 저장처럼
-# 불연속적인 동작 단위로만 바뀌므로 디바운스를 쓰지 않고 즉시 저장함)
+# 실시간 자동저장 디바운스 지연시간(ms): 이 시간 안에 새 키 입력이 있으면 저장을 다시
+# 미루고, 입력이 멈추고 이 시간이 지나야 실제로 디스크에 씀. (컬렉션/체크리스트 탭은
+# 추가/삭제/편집 확정 같은 불연속 동작으로만 바뀌므로 디바운스 없이 즉시 저장함)
 AUTOSAVE_DEBOUNCE_MS = 500
 
 # 백업 ZIP 안의 파일 하나당 읽을 수 있는 최대 크기(바이트). 손상되었거나 악의적으로 만든
@@ -243,6 +278,10 @@ CAL_CELL_H = 34
 # 달력메모 탭 왼쪽(달력) 영역의 고정 폭(px) - 월별보기/1년전체보기/목록보기 폭을 통일하고,
 # 사용자가 크기조절 막대로 바꿀 수 없도록 PanedWindow 대신 고정폭 Frame에 사용
 CAL_LEFT_WIDTH = 360
+# 달력(월별/1년전체 보기)이 지원하는 연도 범위. 연도 입력창 범위이자 달력메모 날짜의 허용 범위
+# (범위 밖 연도는 date 계산에서 예외가 나므로 입력 단계에서 막음)
+CAL_MIN_YEAR = 1900
+CAL_MAX_YEAR = 2100
 
 # Windows 가상 키코드(VK_0~VK_9) -> 숫자 문자열 매핑
 # (<Alt-1> 같은 개별 keysym 바인딩이 Windows에서 씹히는 문제를 우회하기 위해
@@ -255,11 +294,13 @@ PROGRAM_INFO_URL = "https://github.com/alpaca100-kor/AlpacaDiary"
 ALPACA_TOOLS_URL = "https://alpaca100-kor.github.io/AlpacaTools/"
 AUTHOR_BLOG_URL = "https://alpaca100.tistory.com/"
 
-# [도움말 > 단축키 안내](F1) 창에 보여줄 내용이 들어 있는 파일 이름. 안내 문구는 코드에 두지
-# 않고 이 파일에만 둠: 프로그램(exe 또는 ad.py)과 같은 폴더에서 창을 열 때마다 읽으며,
-# exe에는 포함시키지 않음. 작성 규칙은 shortcuts.md 맨 위 주석 참고
+# [도움말 > 단축키 안내](F1) 창에 보여줄 내용이 들어 있는 파일 이름. 안내 문구는 코드가 아니라
+# 이 파일에만 두며, 프로그램(exe 또는 ad.py)과 같은 폴더에서 창을 열 때마다 읽음 (exe에는
+# 포함시키지 않음). 작성 규칙은 shortcuts.md 맨 위 주석 참고
 SHORTCUTS_FILE_NAME = "shortcuts.md"
 
+# 다크/라이트 테마별 색상 팔레트 (sv_ttk의 실제 팔레트 값 기준). ttk가 직접 테마를 입히지
+# 못하는 Listbox/Text/Treeview 인라인편집 위젯에 수동으로 적용하기 위함
 THEME_COLORS = {
     "light": {
         "bg": "#fafafa",
@@ -328,7 +369,7 @@ def apply_titlebar_theme(root, dark):
 
 
 # ============================================================================
-# 앱 구조 안내 (향후 탭을 추가하려는 유지보수자를 위해)
+# 앱 구조 안내 (탭을 추가하려는 유지보수자를 위해)
 # ----------------------------------------------------------------------------
 # MemoStore        : 파일 입출력만 담당 (tkinter 위젯을 전혀 모름). memos /
 #                    calendar_memos / collections / checklists / settings /
@@ -336,13 +377,11 @@ def apply_titlebar_theme(root, dark):
 # SettingsManager  : 설정 상태(글꼴/복사단축키/테마/빠른입력) 보유 + 설정 팝업들.
 # GeneralMemoTab   : "일반메모" 탭 전체(위젯+데이터+동작).
 # CalendarMemoTab  : "달력메모" 탭 전체(위젯+데이터+동작).
-# ChecklistTab     : "체크리스트" 탭 전체(위젯+데이터+동작). CollectionTab의 UI/조작
-#                    방식(왼쪽 목록 + 오른쪽 항목, 인라인 편집, 드래그 순서변경 등)을
-#                    그대로 가져오되, 항목을 URL/메모 대신 완료 여부(상태)+내용으로 단순화.
-# CollectionTab    : "컬렉션" 탭 전체(위젯+데이터+동작). 예전 "엣지 컬렉션
-#                    매니저"의 핵심 기능(컬렉션/항목 CRUD, URL 제목 자동 수집,
-#                    순서 변경)을 이 앱의 800×600 최소 크기에 맞춰 옮긴 것.
-#                    이미지 첨부 기능은 포함하지 않음.
+# ChecklistTab     : "체크리스트" 탭 전체(위젯+데이터+동작). CollectionTab과 같은
+#                    UI/조작 방식(왼쪽 폴더 목록 + 오른쪽 항목, 인라인 편집, 드래그
+#                    순서변경)에 항목을 완료 여부+내용으로 단순화함.
+# CollectionTab    : "컬렉션" 탭 전체(위젯+데이터+동작). 컬렉션/항목 CRUD, URL 제목
+#                    자동 수집, 순서 변경. 이미지 첨부 기능은 없음.
 # MemoApp          : 위를 조립하는 지휘자. 메뉴/전역 단축키/창 생명주기/
 #                    테마·상태표시줄처럼 "탭을 넘나드는" 것만 여기 남김.
 #
@@ -385,12 +424,10 @@ def apply_titlebar_theme(root, dark):
 #      하는 키는 root가 아니라 그 위젯에 직접 bind()하면 되고, 그러면 다른 탭과
 #      자동으로 격리되므로 이런 라우터가 필요 없다.
 #
-# 왜 "지금 활성 탭이 무엇인지" 하드코딩해서 확인하지 않는가:
-#   예전(탭 2개)에는 "일반메모가 아니면 달력메모"라고 가정하는 코드가 많았다.
-#   컬렉션 탭을 더하면서 이 가정이 깨져(그 가정대로면 컬렉션 탭에서 Ctrl+D를
-#   눌러도 "달력메모 삭제"가 실행돼버림), 아래처럼 "활성 탭에 그 이름의
-#   메서드가 있으면 호출하고, 없으면 아무 일도 하지 않는다"는 방식으로 전부
-#   바꿨다. 탭이 몇 개로 늘어나도 이 방식은 그대로 올바르게 동작한다.
+# 활성 탭을 하드코딩해서 확인하지 않는 이유:
+#   "일반메모가 아니면 달력메모" 같은 가정은 탭이 늘면 깨진다(예: 컬렉션 탭에서 Ctrl+D가
+#   달력메모 삭제를 실행함). 그래서 "활성 탭에 그 이름의 메서드가 있으면 호출하고, 없으면
+#   아무 일도 하지 않는다"는 방식으로 라우팅한다. 탭이 몇 개로 늘어도 그대로 동작한다.
 # ============================================================================
 
 
@@ -398,7 +435,8 @@ class MemoStore:
     """memos.json / memos_calendar.json / collections.json / checklists.json /
     settings.ini / quick_inputs.json / holidays.json 파일 입출력만 담당. tkinter
     위젯을 전혀 참조하지 않으므로 GUI 없이도 단위 테스트가 가능함. 저장할 데이터는
-    항상 인자로 받고(self가 데이터를 들고 있지 않음), 읽은 데이터는 검증해서 반환함."""
+    항상 인자로 받고(self가 데이터를 들고 있지 않음), 읽은 데이터는 검증해서 반환하며,
+    읽는 중 생긴 안내 문구만 load_problems/holiday_problems에 모아 둠."""
 
     def __init__(self, app_dir):
         self.file_path = os.path.join(app_dir, "memos.json")
@@ -408,23 +446,22 @@ class MemoStore:
         self.holiday_file = os.path.join(app_dir, "holidays.json")
         self.collections_file = os.path.join(app_dir, "collections.json")
         self.checklists_file = os.path.join(app_dir, "checklists.json")
+        # 시작할 때 읽지 못했거나 일부를 건너뛴 데이터 파일 안내 문구 (시작 후 MemoApp이 한 번 보여줌)
+        self.load_problems = []
 
     def _atomic_write(self, path, write_func):
-        """write_func(파일객체)로 실제 내용을 쓰되, 같은 폴더의 임시 파일에
-        먼저 쓴 뒤 os.replace()로 교체하는 원자적 저장. os.replace()는 파일
-        내용을 옮기는 게 아니라 이름(포인터)만 바꾸는 연산이라 OS가 원자적으로
-        처리하므로, 쓰는 도중 앱이 강제 종료되거나 오류가 나도 원본 파일(path)은
-        손상되지 않고 그대로 남음. (임시 파일은 반드시 같은 폴더에 있어야
-        os.replace()의 원자성이 보장됨)"""
+        """write_func(파일객체)로 내용을 쓰되, 같은 폴더의 임시 파일에 먼저 쓴 뒤 os.replace()로
+        교체하는 원자적 저장. os.replace()는 이름만 바꾸는 연산이라 OS가 원자적으로 처리하므로,
+        쓰는 도중 앱이 강제 종료되거나 오류가 나도 원본 파일(path)은 손상되지 않음.
+        (원자성을 보장하려면 임시 파일이 같은 폴더에 있어야 함)"""
         tmp_path = path + ".tmp"
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
                 write_func(f)
             os.replace(tmp_path, path)
         except Exception:
-            # write_func 내부 오류(TypeError 등)든 디스크 I/O 오류(OSError)든
-            # 종류를 가리지 않고 원본 파일은 아직 손대지 않았으므로 안전함.
-            # 남은 임시 파일만 정리 시도 후 예외를 그대로 위로 전달.
+            # 어떤 예외든 원본은 아직 손대지 않았으므로 안전함. 남은 임시 파일만 정리하고
+            # 예외는 그대로 위로 전달함
             try:
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)
@@ -475,31 +512,69 @@ class MemoStore:
                     result[base] = zf.read(info).decode("utf-8-sig")
         return result
 
-    def load_memos(self):
-        if not os.path.exists(self.file_path):
-            return []
+    def _preserve_original(self, path, reason, move=True):
+        """읽은 데이터가 원본과 달라질 때(손상으로 빈 데이터로 시작하거나, 일부 항목을 건너뜀) 원본을
+        같은 폴더에 남겨 둠. 남기지 않으면 종료할 때의 자동 저장이 원본을 덮어써 영영 사라짐.
+        move=True면 원본을 ".corrupt-시각"으로 옮기고, False면 ".skipped-시각"으로 복사함."""
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        base = f"{path}.{'corrupt' if move else 'skipped'}-{stamp}"
+        dest, n = base, 1
+        while os.path.exists(dest):  # 같은 초에 두 번 보관해도 먼저 보관한 파일을 덮어쓰지 않음
+            n += 1
+            dest = f"{base}-{n}"
         try:
-            with open(self.file_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if not isinstance(data, list):
-                return []
-            # memos.json이 외부에서 손상되거나 title/content 키가 없는 항목이 섞여
-            # 있어도, 이후 코드(on_memo_select 등)가 두 키가 항상 있다고 가정하고
-            # 접근하다가 KeyError로 죽는 일이 없도록 여기서 구조를 정규화함
-            valid_memos = []
-            for memo in data:
-                if not isinstance(memo, dict):
-                    continue
-                title = memo.get("title", "")
-                content = memo.get("content", "")
-                if not isinstance(title, str):
-                    title = str(title)
-                if not isinstance(content, str):
-                    content = str(content)
-                valid_memos.append({"title": title, "content": content})
-            return valid_memos
-        except (json.JSONDecodeError, IOError):
+            if move:
+                os.replace(path, dest)
+            else:
+                shutil.copy2(path, dest)
+            note = f"원본을 '{os.path.basename(dest)}' 파일로 보관했습니다."
+        except OSError:
+            note = "원본 보관에 실패했습니다. 프로그램을 끝내기 전에 이 파일을 직접 복사해 두세요."
+        self.load_problems.append(f"{os.path.basename(path)}: {reason}\n  → {note}")
+
+    def _read_json(self, path, check, quarantine=True):
+        """JSON 파일을 읽어 반환함. 읽을 데이터가 없으면 NO_DATA를 반환함 (호출한 쪽이 기본값 사용).
+
+        - BOM이 붙은 UTF-8(메모장 저장 등)도 읽음.
+        - 파일이 없거나 내용이 비어 있으면 안내 없이 NO_DATA.
+        - 손상(JSON/UTF-8 아님)이거나 check(data)가 False(예상한 구조가 아님)면 NO_DATA를 반환하고,
+          quarantine=True면 원본을 보관한 뒤 load_problems에 안내를 남김. 앱이 쓰지 않는 참고용
+          파일(holidays.json)은 quarantine=False로 불러 원본을 그대로 둠.
+        - 파일을 열지 못하는 경우(권한/사용 중)는 원본을 건드리지 않고 안내만 남김."""
+        if not os.path.exists(path):
+            return NO_DATA
+        name = os.path.basename(path)
+
+        def reject(reason):
+            if quarantine:
+                self._preserve_original(path, reason)
+            else:
+                self.load_problems.append(f"{name}: {reason}\n  → 이 파일은 읽기만 하므로 그대로 두었습니다.")
+            return NO_DATA
+
+        try:
+            with open(path, "r", encoding="utf-8-sig") as f:
+                text = f.read()
+            if not text.strip():
+                return NO_DATA
+            data = json.loads(text)
+        except OSError as e:
+            self.load_problems.append(f"{name}: 파일을 읽지 못했습니다 ({e.__class__.__name__}).")
+            return NO_DATA
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return reject("올바른 JSON(UTF-8) 파일이 아니라서 읽지 못했습니다.")
+        if not check(data):
+            return reject("예상한 데이터 구조가 아니라서 읽지 못했습니다.")
+        return data
+
+    def load_memos(self):
+        data = self._read_json(self.file_path, lambda d: isinstance(d, list))
+        if data is NO_DATA:
             return []
+        # title/content 키가 없거나 문자열이 아닌 항목이 섞여 있어도 이후 코드가 KeyError로
+        # 죽지 않도록 여기서 구조를 정규화함
+        return [{"title": str(memo.get("title", "")), "content": str(memo.get("content", ""))}
+                for memo in data if isinstance(memo, dict)]
 
     def save_memos(self, memos):
         try:
@@ -510,64 +585,42 @@ class MemoStore:
             return False
 
     def load_holidays(self):
-        """대한민국 공휴일 정보를 holidays.json에서 불러옴 (없거나 손상되었으면 빈 딕셔너리).
-        {"YYYY-MM-DD": "공휴일 이름"} 형태이며, memos_calendar.json과 달리 앱이 이 파일에
-        쓰지는 않는 참고용 데이터임 - 최신 연도를 쓰려면 이 파일을 직접 교체/추가해야 함.
-
-        직접 편집하다 생긴 오타가 달력/목록 동작에 영향을 주지 않도록 항목마다 검증해서
-        올바른 것만 사용하고, 건너뛴 항목은 self.holiday_problems에 기록함(앱이 시작된 뒤
-        한 번 안내함). 날짜는 0이 채워진 YYYY-MM-DD 형식이고 실제로 있는 날짜여야 하며,
-        이름은 비어 있지 않은 문자열이어야 함. (strptime은 "2026-9-5"도 통과시키지만 달력은
-        "2026-09-05" 키로 찾으므로 정규식으로 자릿수까지 확인함)"""
+        """대한민국 공휴일을 holidays.json에서 불러옴 (없거나 손상되었으면 빈 딕셔너리).
+        {"YYYY-MM-DD": "공휴일 이름"} 형태이며, 앱이 쓰지는 않는 참고용 파일이라 최신 연도를
+        쓰려면 직접 교체/추가해야 함. 직접 편집하다 생긴 오타가 달력/목록에 영향을 주지 않도록
+        항목마다 검증해(날짜는 normalize_date_key, 이름은 비어 있지 않은 문자열) 올바른 것만
+        쓰고, 건너뛴 항목은 self.holiday_problems에 기록함(시작 후 한 번 안내함)."""
         self.holiday_problems = []
-        if not os.path.exists(self.holiday_file):
-            return {}
-        try:
-            with open(self.holiday_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
-            return {}
-        if not isinstance(data, dict):
+        data = self._read_json(self.holiday_file, lambda d: isinstance(d, dict), quarantine=False)
+        if data is NO_DATA:
             return {}
         holidays = {}
         for key, name in data.items():
-            if not (isinstance(key, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", key)):
-                self.holiday_problems.append(f"{key!r}: 날짜 형식이 YYYY-MM-DD가 아닙니다")
-                continue
-            try:
-                datetime.strptime(key, "%Y-%m-%d")
-            except ValueError:
-                self.holiday_problems.append(f"{key}: 존재하지 않는 날짜입니다")
+            norm = normalize_date_key(key)
+            if norm is None:
+                self.holiday_problems.append(
+                    f"{key!r}: 올바른 날짜(YYYY-MM-DD, {CAL_MIN_YEAR}~{CAL_MAX_YEAR}년)가 아닙니다")
                 continue
             if not isinstance(name, str) or not name.strip():
                 self.holiday_problems.append(f"{key}: 공휴일 이름이 비어 있거나 문자열이 아닙니다")
                 continue
-            holidays[key] = name.strip()
+            holidays[norm] = name.strip()
         return holidays
 
     def load_calendar_memos(self):
         """달력메모(memos_calendar.json)를 불러옴: {"YYYY-MM-DD": "내용", ...} 형태.
-        (가져오기 기능(CalendarMemoTab.transfer_parse)과 동일한 수준으로 날짜 형식과 값이
-        문자열인지 검증함 - 둘의 검증 수준이 달라 파일을 직접 열었을 때만 이상한
-        데이터가 통과하는 일이 없도록 함)"""
-        if not os.path.exists(self.calendar_file_path):
+        가져오기(CalendarMemoTab.transfer_parse)와 같은 normalize_calendar_memos로 검증함.
+        건너뛴 항목이 있으면 원본을 복사해 두고 시작 후 안내함."""
+        data = self._read_json(self.calendar_file_path, lambda d: isinstance(d, dict))
+        if data is NO_DATA:
             return {}
-        try:
-            with open(self.calendar_file_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if not isinstance(data, dict):
-                return {}
-            valid_memos = {}
-            for date_key, content in data.items():
-                try:
-                    datetime.strptime(date_key, "%Y-%m-%d")
-                except (ValueError, TypeError):
-                    continue
-                if isinstance(content, str):
-                    valid_memos[date_key] = content
-            return valid_memos
-        except (json.JSONDecodeError, IOError):
-            return {}
+        memos, skipped = normalize_calendar_memos(data)
+        if skipped:
+            self._preserve_original(
+                self.calendar_file_path,
+                f"날짜 형식이 올바르지 않거나 내용이 문자열이 아닌 항목 {len(skipped)}개를 건너뛰었습니다.",
+                move=False)
+        return memos
 
     def save_calendar_memos(self, calendar_memos):
         try:
@@ -579,17 +632,10 @@ class MemoStore:
 
     def load_quick_inputs(self):
         """Alt+1~Alt+0에 대응하는 빠른 입력 문구를 불러옴 (없으면 전부 빈 문자열)"""
-        empty = {key: "" for key in QUICK_INPUT_KEYS}
-        if not os.path.exists(self.quick_input_file):
-            return empty
-        try:
-            with open(self.quick_input_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if not isinstance(data, dict):
-                return empty
-            return {key: data.get(key, "") for key in QUICK_INPUT_KEYS}
-        except (json.JSONDecodeError, IOError):
-            return empty
+        data = self._read_json(self.quick_input_file, lambda d: isinstance(d, dict))
+        if data is NO_DATA:
+            return {key: "" for key in QUICK_INPUT_KEYS}
+        return {key: (data[key] if isinstance(data.get(key), str) else "") for key in QUICK_INPUT_KEYS}
 
     def save_quick_inputs(self, quick_inputs):
         try:
@@ -614,12 +660,11 @@ class MemoStore:
             return default_settings
 
         try:
-            config.read(self.settings_file, encoding='utf-8')
+            config.read(self.settings_file, encoding='utf-8-sig')
             font_family = config.get('Font', 'family', fallback=default_settings['font_family'])
             font_size = config.getint('Font', 'size', fallback=default_settings['font_size'])
-            if not (8 <= font_size <= 72):
-                # settings.ini가 손상되거나 직접 편집되어 범위를 벗어난 값(예: 음수)이면
-                # 글꼴 설정창의 허용 범위(8~72)를 기준으로 기본값으로 되돌림
+            if not (FONT_SIZE_MIN <= font_size <= FONT_SIZE_MAX):
+                # 범위를 벗어난 값(손상/직접 편집)은 기본값으로 되돌림
                 font_size = default_settings['font_size']
             window_geometry = config.get('Window', 'geometry', fallback=default_settings['window_geometry'])
             copy_shortcut = config.get('Shortcuts', 'copy', fallback=default_settings['copy_shortcut'])
@@ -669,44 +714,38 @@ class MemoStore:
 
     def load_collections(self):
         """collections.json 로드: {"collections": [{"id","name","created",
-        "items":[{"id","title","url","memo","added"}]}]} 형태. 파일이 없거나
-        손상되었으면 빈 컬렉션 목록을 반환하고, 있으면 각 항목의 키/타입을
-        검증해 이후 코드가 예상치 못한 값 때문에 죽지 않게 함
-        (load_calendar_memos와 같은 방식). 예전 "엣지 컬렉션 매니저"가 만든
-        collections.json을 이 폴더에 그대로 옮겨 놓아도 읽을 수 있음(이미지
-        경로 등 이 앱이 쓰지 않는 여분의 키는 무시함)."""
-        if not os.path.exists(self.collections_file):
+        "items":[{"id","title","url","memo","added"}]}]} 형태. 파일이 없거나 손상되었으면
+        빈 컬렉션 목록을 반환하고(손상이면 원본은 보관), 있으면 각 항목의 키/타입을 검증해
+        이후 코드가 예상치 못한 값 때문에 죽지 않게 함. "엣지 컬렉션 매니저"가 만든
+        collections.json도 읽을 수 있음(이 앱이 쓰지 않는 여분의 키는 무시함)."""
+        data = self._read_json(
+            self.collections_file,
+            lambda d: isinstance(d, dict) and isinstance(d.get("collections"), list))
+        if data is NO_DATA:
             return {"collections": []}
-        try:
-            with open(self.collections_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if not isinstance(data, dict) or not isinstance(data.get("collections"), list):
-                return {"collections": []}
-            cleaned = []
-            for col in data["collections"]:
-                if not isinstance(col, dict):
+        cleaned = []
+        for col in data["collections"]:
+            if not isinstance(col, dict):
+                continue
+            raw_items = col.get("items")
+            items = []
+            for it in (raw_items if isinstance(raw_items, list) else []):
+                if not isinstance(it, dict):
                     continue
-                raw_items = col.get("items")
-                items = []
-                for it in (raw_items if isinstance(raw_items, list) else []):
-                    if not isinstance(it, dict):
-                        continue
-                    items.append({
-                        "id": str(it.get("id") or short_id()),
-                        "title": str(it.get("title", "")),
-                        "url": str(it.get("url", "")),
-                        "memo": str(it.get("memo", "")),
-                        "added": str(it.get("added", "")),
-                    })
-                cleaned.append({
-                    "id": str(col.get("id") or short_id()),
-                    "name": str(col.get("name", "이름 없음")),
-                    "created": str(col.get("created", "")),
-                    "items": items,
+                items.append({
+                    "id": str(it.get("id") or short_id()),
+                    "title": str(it.get("title", "")),
+                    "url": str(it.get("url", "")),
+                    "memo": str(it.get("memo", "")),
+                    "added": str(it.get("added", "")),
                 })
-            return {"collections": cleaned}
-        except (json.JSONDecodeError, IOError):
-            return {"collections": []}
+            cleaned.append({
+                "id": str(col.get("id") or short_id()),
+                "name": str(col.get("name", "이름 없음")),
+                "created": str(col.get("created", "")),
+                "items": items,
+            })
+        return {"collections": cleaned}
 
     def save_collections(self, data):
         try:
@@ -721,37 +760,33 @@ class MemoStore:
         "items":[{"id","content","checked","added"}]}]} 형태. load_collections와
         같은 방식으로 파일이 없거나 손상되었으면 빈 폴더 목록을 반환하고, 있으면
         각 항목의 키/타입을 검증해 이후 코드가 예상치 못한 값 때문에 죽지 않게 함"""
-        if not os.path.exists(self.checklists_file):
+        data = self._read_json(
+            self.checklists_file,
+            lambda d: isinstance(d, dict) and isinstance(d.get("folders"), list))
+        if data is NO_DATA:
             return {"folders": []}
-        try:
-            with open(self.checklists_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if not isinstance(data, dict) or not isinstance(data.get("folders"), list):
-                return {"folders": []}
-            cleaned = []
-            for folder in data["folders"]:
-                if not isinstance(folder, dict):
+        cleaned = []
+        for folder in data["folders"]:
+            if not isinstance(folder, dict):
+                continue
+            raw_items = folder.get("items")
+            items = []
+            for it in (raw_items if isinstance(raw_items, list) else []):
+                if not isinstance(it, dict):
                     continue
-                raw_items = folder.get("items")
-                items = []
-                for it in (raw_items if isinstance(raw_items, list) else []):
-                    if not isinstance(it, dict):
-                        continue
-                    items.append({
-                        "id": str(it.get("id") or short_id()),
-                        "content": str(it.get("content", "")),
-                        "checked": bool(it.get("checked", False)),
-                        "added": str(it.get("added", "")),
-                    })
-                cleaned.append({
-                    "id": str(folder.get("id") or short_id()),
-                    "name": str(folder.get("name", "이름 없음")),
-                    "created": str(folder.get("created", "")),
-                    "items": items,
+                items.append({
+                    "id": str(it.get("id") or short_id()),
+                    "content": str(it.get("content", "")),
+                    "checked": bool(it.get("checked", False)),
+                    "added": str(it.get("added", "")),
                 })
-            return {"folders": cleaned}
-        except (json.JSONDecodeError, IOError):
-            return {"folders": []}
+            cleaned.append({
+                "id": str(folder.get("id") or short_id()),
+                "name": str(folder.get("name", "이름 없음")),
+                "created": str(folder.get("created", "")),
+                "items": items,
+            })
+        return {"folders": cleaned}
 
     def save_checklists(self, data):
         try:
@@ -808,8 +843,7 @@ class SettingsManager:
         settings_win.transient(self.app.root)
         settings_win.grab_set()
         settings_win.focus_force()
-        # cancel_action은 이 함수 안에서 나중에 정의되지만, 람다는 호출되는 시점(Esc를
-        # 누르는 시점)에 이름을 찾으므로 여기서 미리 바인딩해도 문제 없음
+        # cancel_action은 아래에서 정의되지만, 람다는 Esc를 누를 때 이름을 찾으므로 미리 바인딩해도 됨
         settings_win.bind("<Escape>", lambda e: cancel_action())
 
         ttk.Label(settings_win, text="글꼴:", font=UI_FONT).grid(row=0, column=0, padx=10, pady=10, sticky="w")
@@ -821,25 +855,34 @@ class SettingsManager:
 
         ttk.Label(settings_win, text="크기:", font=UI_FONT).grid(row=1, column=0, padx=10, pady=10, sticky="w")
         size_var = tk.StringVar(value=str(self.content_font[1]))
-        size_spinbox = ttk.Spinbox(settings_win, from_=8, to=72, textvariable=size_var, width=5)
+        size_spinbox = ttk.Spinbox(settings_win, from_=FONT_SIZE_MIN, to=FONT_SIZE_MAX, textvariable=size_var, width=5)
         size_spinbox.grid(row=1, column=1, padx=10, pady=10, sticky="w")
 
         def apply_and_save():
+            """입력값을 검사해 적용·저장함. 입력이 올바르지 않으면 안내만 하고 False를 반환함
+            (스핀박스는 직접 입력한 값의 범위/숫자 여부를 검사하지 않으므로 여기서 확인)"""
             new_font_family = font_var.get()
             try:
                 new_font_size = int(size_var.get())
-                self.content_font = (new_font_family, new_font_size)
-                for tab in self.app.tabs:
-                    tab.set_content_font(self.content_font)
-                self.settings["font_family"] = new_font_family
-                self.settings["font_size"] = new_font_size
-                self.save()
             except ValueError:
-                messagebox.showerror("오류", "올바른 글자 크기를 입력하세요.", parent=settings_win)
+                new_font_size = None
+            if new_font_size is None or not (FONT_SIZE_MIN <= new_font_size <= FONT_SIZE_MAX):
+                messagebox.showerror(
+                    "오류", f"글자 크기는 {FONT_SIZE_MIN}~{FONT_SIZE_MAX} 사이의 정수로 입력하세요.",
+                    parent=settings_win)
+                size_spinbox.focus_set()
+                return False
+            self.content_font = (new_font_family, new_font_size)
+            for tab in self.app.tabs:
+                tab.set_content_font(self.content_font)
+            self.settings["font_family"] = new_font_family
+            self.settings["font_size"] = new_font_size
+            self.save()
+            return True
 
         def save_action():
-            apply_and_save()
-            settings_win.destroy()
+            if apply_and_save():
+                settings_win.destroy()
 
         def cancel_action():
             settings_win.destroy()
@@ -871,12 +914,9 @@ class SettingsManager:
 
         def apply_and_save():
             new_shortcut = shortcut_var.get()
-            # 기존 단축키 바인딩 제거
             self.unbind_copy_shortcut()
-            # 새 단축키 설정
             self.copy_shortcut = new_shortcut
             self.settings["copy_shortcut"] = new_shortcut
-            # 새 단축키 바인딩
             self.bind_copy_shortcut()
             self.save()
 
@@ -1054,10 +1094,8 @@ class GeneralMemoTab:
 
         content_label = ttk.Label(right_panel, text="메모 내용", font=UI_FONT)
         content_label.pack(anchor="w")
-        # height=1: 지정 안 하면 Text 기본값(24줄) 기준으로 자연 요구 크기가 매우 커져서,
-        # 창이 작을 때 fill/expand로 실제 크기가 줄어들어도 레이아웃 계산에서 아래
-        # [복사] 버튼 등 형제 위젯이 창 밖으로 밀려나는 원인이 됨. height=1로 자연
-        # 요구 크기를 최소화하고, 실제 크기는 fill=BOTH+expand=True가 결정하게 함
+        # height=1: 지정하지 않으면 Text 기본 높이(24줄)가 자연 요구 크기가 되어, 창이 작을 때
+        # 아래 [복사] 버튼 등 형제 위젯이 창 밖으로 밀려남. 실제 크기는 fill=BOTH+expand가 결정함
         self.content_text = tk.Text(right_panel, font=app.settings_mgr.content_font, padx=10, pady=8, height=1)
         self.content_text.pack(fill=tk.BOTH, expand=True)
         self.content_text.bind("<KeyRelease>", lambda event: self.update_memo_realtime(event, update_list=False))
@@ -1216,8 +1254,7 @@ class GeneralMemoTab:
 
         Args:
             preserve_scroll: True이면 다시 그리기 전에 맨 위에 보이던 행 번호를 기억했다가
-                그 위치로 되돌림. (예전에는 스크롤 비율로 되돌렸는데, 메모가 추가/삭제되어
-                전체 행 수가 바뀌면 비율이 어긋나 엉뚱한 위치로 갔으므로 행 번호 기준으로 함)
+                그 위치로 되돌림. (스크롤 비율은 행 수가 바뀌면 어긋나므로 행 번호 기준)
             top_adjust: 보던 위치보다 앞쪽 행이 추가/삭제되어 행 번호가 밀린 만큼의 보정값
                 (예: 화면 위쪽에 있던 행을 삭제했다면 -1)
         """
@@ -1274,8 +1311,8 @@ class GeneralMemoTab:
             self.update_listbox(preserve_scroll=True,
                                 top_adjust=-1 if removed_index < top_before else 0)
             if self.memos:
-                # 다시 그리면 활성(active) 항목이 맨 위(0번)로 초기화되어, 이어서 ↑↓를
-                # 누르면 목록 맨 위 근처로 튀므로 삭제한 자리로 되돌림 (선택은 하지 않음)
+                # 다시 그리면 활성(active) 항목이 0번으로 초기화되어 이어서 ↑↓를 누르면
+                # 목록 맨 위 근처로 튀므로 삭제한 자리로 되돌림 (선택은 하지 않음)
                 self.listbox.activate(min(removed_index, len(self.memos) - 1))
             self.app.save_memos()
 
@@ -1292,11 +1329,10 @@ class GeneralMemoTab:
             self.update_listbox_selection()
 
     def _is_listbox_focused(self):
-        """PageUp/PageDown 순서변경 단축키를 리스트박스에 포커스가 있을 때만
-        허용하기 위한 확인. (Text/Entry의 기본 Prior/Next 바인딩은 break를
-        호출하지 않아 이벤트가 그대로 root까지 전파되는 tkinter 특성 때문에,
-        이 확인이 없으면 메모 내용을 스크롤하려고 PageUp/PageDown을 누르는
-        것만으로 (심지어 다른 탭에서도) 메모 순서가 같이 바뀌는 문제가 있었음)"""
+        """PageUp/PageDown 순서변경 단축키를 리스트박스에 포커스가 있을 때만 허용하기 위한
+        확인. Text/Entry의 기본 Prior/Next 바인딩은 break를 호출하지 않아 이벤트가 root까지
+        전파되므로, 이 확인이 없으면 메모 내용을 스크롤하려고 PageUp/PageDown을 눌러도
+        (다른 탭에서도) 메모 순서가 바뀜."""
         return self.app.root.focus_get() is self.listbox
 
     def on_home_key(self, event=None):
@@ -1350,10 +1386,8 @@ class GeneralMemoTab:
             return
 
         title = self.title_entry.get()
-        # get("1.0", tk.END)는 Tk Text 위젯이 항상 자동으로 붙이는 마지막 개행까지
-        # 포함해서 반환하므로, 그 한 글자만 제외하는 "end-1c"를 사용함. .strip()으로
-        # 앞뒤 공백/빈 줄까지 제거하면 사용자가 일부러 넣은 끝줄 공백이나 빈 줄이
-        # 저장 시 사라지므로, 원본 그대로 저장함
+        # "end-1c": Text가 항상 끝에 붙이는 개행 한 글자만 제외함. .strip()은 사용자가 넣은
+        # 끝줄 공백/빈 줄까지 지우므로 쓰지 않고 원본 그대로 저장함
         content = self.content_text.get("1.0", "end-1c")
         self.memos[self.current_index] = {"title": title, "content": content}
 
@@ -1376,13 +1410,10 @@ class GeneralMemoTab:
         return
 
     def on_drag_motion(self, event):
-        """드래그 중: 현재 마우스 위치를 활성(active) 표시로만 안내.
-        (selection_set() 대신 activate()로 바꾼 것만으로는 부족했음 - Listbox
-        위젯 자체의 기본 클래스 바인딩이 <B1-Motion>에서 마우스가 지나가는
-        항목을 스스로 선택(selection)하도록 되어 있어서, 우리 쪽 인스턴스
-        바인딩과는 별개로 계속 실행되며 <<ListboxSelect>>를 발생시켜 편집창이
-        바뀌는 문제가 그대로 남아 있었음. 반드시 "break"를 반환해서 Listbox의
-        기본 동작 자체가 실행되지 않도록 막아야 함)"""
+        """드래그 중: 현재 마우스 위치를 활성(active) 표시로만 안내함.
+        Listbox의 기본 클래스 바인딩은 <B1-Motion>에서 지나가는 항목을 스스로 선택하고
+        <<ListboxSelect>>를 발생시켜 편집창이 바뀌므로, 반드시 "break"를 반환해 기본 동작을
+        막아야 함."""
         if self.drag_start_index is None:
             return
 
@@ -1418,19 +1449,18 @@ class GeneralMemoTab:
         self.drag_start_index = None
 
     # ---- 가져오기/내보내기/백업 훅 ----
-    # 파일 선택·확인창·형식별 저장 흐름은 MemoApp(import_current_tab/export_current_tab/
-    # backup_all/restore_all)이 모든 탭에 공통으로 처리하고, 탭은 자기 데이터에만 고유한
-    # 부분(검증, 화면 반영, TXT/XLSX 모양)을 아래 훅으로 제공함.
+    # 파일 선택/확인창/형식별 저장 흐름은 MemoApp이 모든 탭에 공통으로 처리하고, 탭은 자기
+    # 데이터에 고유한 부분(검증, 화면 반영, TXT/XLSX 모양)만 아래 훅으로 제공함 (파일 위
+    # "앱 구조 안내" 참고)
 
     transfer_label = "일반메모"
     transfer_filename = "memos.json"
 
     def transfer_parse(self, raw):
         """가져온 JSON을 검증하고 정규화한 메모 리스트를 반환 (구조가 잘못되면 TypeError/ValueError).
-        키가 존재하는지만 보면 title이 숫자거나 content가 객체인 경우도 통과해서 리스트박스/
-        Text에 지저분한 값이 그대로 들어갈 수 있으므로 값의 타입까지 확인함 (내부 memos.json
-        로딩(load_memos)과 달리, 가져오기는 사용자가 명시적으로 확인 후 실행하는 동작이라
-        조용히 보정하지 않고 오류로 알림)"""
+        키 존재만 보면 title이 숫자거나 content가 객체인 경우도 통과하므로 값의 타입까지 확인함.
+        memos.json 로드(load_memos)와 달리 가져오기는 사용자가 확인하고 실행하는 동작이라
+        조용히 보정하지 않고 오류로 알림."""
         if not isinstance(raw, list):
             raise TypeError("데이터가 리스트 형식이 아닙니다.")
         cleaned = []
@@ -1487,7 +1517,7 @@ class CalendarMemoTab:
         cal_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         self.calendar_pane = cal_container
 
-        # ---- 왼쪽: 달력 (고정 폭 - 사용자가 크기조절 막대로 바꿀 수 없도록 PanedWindow 대신 사용) ----
+        # ---- 왼쪽: 달력 (고정 폭: 크기조절 막대로 바꿀 수 없도록 PanedWindow 대신 Frame 사용) ----
         cal_left = ttk.Frame(cal_container, width=CAL_LEFT_WIDTH)
         cal_left.pack(side=tk.LEFT, fill=tk.Y)
         cal_left.pack_propagate(False)
@@ -1496,21 +1526,17 @@ class CalendarMemoTab:
 
         self.cal_view_notebook = ttk.Notebook(cal_left)
 
-        # 기본 ttk 버튼의 좌우 패딩이 넓어서 여러 개를 고정폭 안에 나란히 놓으면 밀려나
-        # 화면 밖으로 잘리므로, 이 좌측 영역(cal_left, 고정폭)에서 쓰는 버튼들은 좌우
-        # 패딩을 줄인 전용 스타일을 공유해서 씀 (아래 공용 4버튼과, 월별보기의
-        # 이전/오늘/다음 버튼 모두 이 스타일을 사용함)
+        # 기본 ttk 버튼은 좌우 패딩이 넓어 고정폭 안에 여러 개를 놓으면 잘리므로, 이 좌측
+        # 영역(cal_left)의 버튼들(아래 공용 4버튼과 월별보기의 이전/오늘/다음)은 패딩을 줄인
+        # 전용 스타일을 공유함
         nav_btn_style = ttk.Style()
         nav_btn_style.configure("CalNav.TButton", padding=(2, 4), width=1)
 
-        # [추가]/[제거]/[◀이전]/[다음▶] 버튼 - 달력 영역(cal_left) 맨 아래, 상태표시줄
-        # 바로 위. side=BOTTOM으로 먼저 배치해야 아래에서 expand=True로 채워지는
-        # 노트북이 이 영역을 침범하지 않음(pack은 호출 순서대로 공간을 배정함).
-        # [월별보기]/[1년전체보기]/[목록보기] 중 어느 서브탭에 있든 이 네 버튼은 항상
-        # 같은 자리에서 동일하게 동작함. 명칭에서 "메모"를 빼고 전용 스타일(CalNav.TButton)로
-        # 좌우 패딩을 줄여 고정폭(CAL_LEFT_WIDTH) 안에 4개가 모두 보이도록 했고, 배치
-        # 순서도 다른 탭([추가][제거][▲][▼])과 일관되도록 [추가][제거][◀이전][다음▶]
-        # 순으로 맞춤
+        # [추가]/[제거]/[◀이전]/[다음▶] 버튼 - 달력 영역(cal_left) 맨 아래, 상태표시줄 바로 위.
+        # side=BOTTOM으로 먼저 배치해야 아래에서 expand=True로 채워지는 노트북이 이 영역을
+        # 침범하지 않음(pack은 호출 순서대로 공간을 배정함). [월별보기]/[1년전체보기]/
+        # [목록보기] 중 어느 서브탭에 있든 항상 같은 자리에서 같은 동작을 함. 전용 스타일
+        # (CalNav.TButton)로 패딩을 줄여 고정폭(CAL_LEFT_WIDTH) 안에 4개가 모두 보임
         cal_nav_buttons = ttk.Frame(cal_left)
         cal_nav_buttons.pack(side=tk.BOTTOM, fill=tk.X, pady=(6, 0))
         add_memo_btn = ttk.Button(cal_nav_buttons, text="추가", style="CalNav.TButton",
@@ -1532,13 +1558,11 @@ class CalendarMemoTab:
 
         self.cal_view_notebook.pack(fill=tk.BOTH, expand=True)
         self.cal_view_notebook.bind("<<NotebookTabChanged>>", self._on_cal_view_tab_changed)
-        # cal_view_notebook은 ttk.Notebook이라 Ctrl+Tab/Ctrl+Shift+Tab에 대한 자체
-        # 기본 바인딩(자신의 서브탭끼리 전환)을 갖고 있음. 이 서브노트북 위젯 자체에
-        # 키보드 포커스가 있으면(탭 헤더를 클릭하거나 Alt+M/Y/L로 전환한 직후 등) 그
-        # 기본 동작이 root 레벨 바인딩보다 먼저 실행돼, 최상단 [일반메모]/[달력메모]/
-        # [컬렉션] 전환이 아니라 이 서브탭끼리만 전환되는 문제가 있었음. 위젯
-        # 인스턴스에 직접 같은 키를 바인딩해 "break"로 가로채면 클래스 기본 동작보다
-        # 먼저 처리되어 이 문제가 해결됨
+        # cal_view_notebook은 ttk.Notebook이라 Ctrl+Tab/Ctrl+Shift+Tab에 대한 자체 기본
+        # 바인딩(자신의 서브탭끼리 전환)을 가짐. 이 위젯에 포커스가 있으면(탭 헤더를 클릭하거나
+        # Alt+M/Y/L로 전환한 직후 등) 그 기본 동작이 root 레벨 바인딩보다 먼저 실행되어 최상단
+        # 탭 대신 서브탭끼리만 전환됨. 인스턴스에 같은 키를 직접 바인딩하고 "break"로 가로채면
+        # 클래스 기본 동작보다 먼저 처리됨
         self.cal_view_notebook.bind("<Control-Tab>", lambda e: self.app._cycle_top_tab(1))
         self.cal_view_notebook.bind("<Control-Shift-Tab>", lambda e: self.app._cycle_top_tab(-1))
 
@@ -1563,7 +1587,7 @@ class CalendarMemoTab:
 
         nav_controls = ttk.Frame(m_nav)
         nav_controls.grid(row=0, column=1, columnspan=7)
-        year_spin = ttk.Spinbox(nav_controls, from_=1900, to=2100, textvariable=self.month_year_var,
+        year_spin = ttk.Spinbox(nav_controls, from_=CAL_MIN_YEAR, to=CAL_MAX_YEAR, textvariable=self.month_year_var,
                                  width=6, command=self._commit_month_year)
         year_spin.pack(side=tk.LEFT)
         year_spin.bind("<Return>", self._commit_month_year)
@@ -1615,7 +1639,7 @@ class CalendarMemoTab:
 
         y_nav = ttk.Frame(year_tab)
         y_nav.pack(fill=tk.X, padx=6, pady=(8, 4))
-        year_spin_y = ttk.Spinbox(y_nav, from_=1900, to=2100, textvariable=self.year_year_var,
+        year_spin_y = ttk.Spinbox(y_nav, from_=CAL_MIN_YEAR, to=CAL_MAX_YEAR, textvariable=self.year_year_var,
                                    width=6, command=self._commit_year_year)
         year_spin_y.pack(side=tk.LEFT)
         year_spin_y.bind("<Return>", self._commit_year_year)
@@ -1662,15 +1686,13 @@ class CalendarMemoTab:
         self.year_canvas.bind("<Leave>", lambda e: self.year_canvas.unbind_all("<MouseWheel>"))
 
         # -- 목록보기 (달력 그리드 대신, 메모가 있는 날짜만 목록으로 보여줌) --
-        # 이전메모/다음메모/메모추가/메모제거는 아래 공용 cal_nav_buttons에만 있고,
-        # 이 서브탭 자체에는 목록과 "공휴일 표시" 체크박스만 있음 (다른 서브탭과 같은
-        # 자리에서 같은 동작을 하는 버튼을 굳이 이 탭 안에 또 둘 필요가 없음)
+        # 추가/제거/이전/다음 버튼은 위의 공용 cal_nav_buttons에만 있고, 이 서브탭에는 목록과
+        # "공휴일 표시" 체크박스만 있음 (다른 서브탭과 같은 동작을 하는 버튼을 또 둘 필요가 없음)
         self._date_list_keys = []  # date_listbox의 각 행이 어떤 날짜인지 (표시 순서대로)
 
         # [공휴일 표시] 체크박스 - 목록 아래쪽에 고정. side=BOTTOM으로 목록(list_container)보다
-        # 먼저 배치해야 아래에서 expand=True로 채워지는 목록이 이 자리를 침범하지 않음(pack은
-        # 호출 순서대로 공간을 배정함). 체크 상태는 settings.ini에 저장해 다음 실행 때도
-        # 기억하고, Alt+H(목록보기 서브탭이 활성화되어 있을 때만 동작 - on_alt_h 참고)로도
+        # 먼저 배치해야 expand=True로 채워지는 목록이 이 자리를 침범하지 않음. 체크 상태는
+        # settings.ini에 저장되고, Alt+H(목록보기 서브탭이 활성일 때만 동작 - on_alt_h 참고)로도
         # 켜고 끌 수 있음
         list_bottom = ttk.Frame(list_tab)
         list_bottom.pack(side=tk.BOTTOM, fill=tk.X, padx=6, pady=(4, 8))
@@ -1689,11 +1711,10 @@ class CalendarMemoTab:
         date_list_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.date_listbox.config(yscrollcommand=date_list_scroll.set)
         self.date_listbox.bind("<<ListboxSelect>>", self._on_date_listbox_select)
-        # 날짜 목록 단축키: 이 위젯에 직접 바인딩해서, 날짜 목록에 키보드 포커스가 있을
-        # 때만 동작하게 함 (오른쪽 메모 편집창의 Home/Delete 같은 기본 텍스트 편집
-        # 동작과 섞이지 않음). Home/End는 Listbox 기본 동작(가로 스크롤)을 대체하므로
-        # 핸들러가 "break"를 반환함. 다른 서브탭/탭으로 전환돼 목록이 화면에서 사라진
-        # 뒤에는 동작하지 않음 (bind_when_visible)
+        # 날짜 목록 단축키: 이 위젯에 직접 바인딩해서 날짜 목록에 포커스가 있을 때만 동작하게 함
+        # (오른쪽 편집창의 Home/Delete 같은 기본 편집 동작과 섞이지 않음). Home/End는 Listbox
+        # 기본 동작(가로 스크롤)을 대체하므로 핸들러가 "break"를 반환함. bind_when_visible로
+        # 걸었으므로 목록이 화면에서 사라진 뒤에는 동작하지 않음
         bind_when_visible(self.date_listbox, "<Delete>", self._on_date_list_delete)
         bind_when_visible(self.date_listbox, "<Home>", self._on_date_list_home)
         bind_when_visible(self.date_listbox, "<End>", self._on_date_list_end)
@@ -1772,12 +1793,9 @@ class CalendarMemoTab:
         self.render_month_view()
         self.year_grid_frame.config(bg=colors["border"])
         self.render_year_view()
-        # 이 메서드가 (테마 적용의 부수효과로) 곧 앱 시작 시 최초 1회 호출되는 지점이라,
-        # 월별보기/1년전체보기와 마찬가지로 목록보기도 여기서 한 번 그려줘야 함. 이걸
-        # 빠뜨리면 처음 실행 후 목록보기 탭을 눌러도 빈 화면만 보이다가, 이전/다음 메모
-        # 이동이나 메모 추가처럼 on_calendar_date_click()을 거치는 다른 동작을 해야만
-        # (그 안에서 _refresh_calendar_views()가 호출되며) 비로소 목록이 채워지는
-        # 문제가 있었음
+        # 이 메서드는 (테마 적용의 부수효과로) 앱 시작 시 최초 1회 호출되는 지점이므로, 월별/
+        # 1년전체 보기와 마찬가지로 목록보기도 여기서 한 번 그려야 처음 실행 후 목록보기 탭이
+        # 비어 보이지 않음
         self._refresh_date_list()
 
     def get_status_text(self):
@@ -1799,7 +1817,7 @@ class CalendarMemoTab:
         return (self.date_content_text, self.date_copy_status_label)
 
     def on_activated(self, event=None):
-        """[일반메모]/[달력메모]/[컬렉션] 탭 전환으로 이 탭이 선택되는 순간 호출됨.
+        """탭 전환으로 이 탭이 선택되는 순간 호출됨.
         "오늘" 표시가 최신 날짜를 반영하도록 다시 그림(자정 경과 대비)."""
         if self._is_year_view_active():
             self.render_year_view()
@@ -1821,13 +1839,9 @@ class CalendarMemoTab:
         return "break"
 
     def focus_primary(self, event=None):
-        """Ctrl+T: 서브탭에 관계없이 오늘이 있는 달/해로 이동함과 동시에 오늘 날짜를
-        선택해 오른쪽 편집창도 오늘 메모로 전환함 (go_to_today()가 처리).
-        이전에는 1년전체보기에서만 [올해] 버튼과 동일하게 달력 이동만 하고 선택은
-        바꾸지 않아 다른 서브탭과 동작이 달랐던 것을, 일관된 사용자 경험을 위해
-        모든 서브탭에서 동일하게 동작하도록 통일함. (반면 1년전체보기의 [올해]
-        마우스 버튼 자체는 go_to_year만 호출하는 기존 동작을 그대로 유지함 - 이번
-        요청은 Ctrl+T 단축키에 한정됨)"""
+        """Ctrl+T: 서브탭에 관계없이 오늘이 있는 달/해로 이동하고 오늘 날짜를 선택해 오른쪽
+        편집창도 오늘 메모로 전환함 (go_to_today()가 처리). 1년전체보기의 [올해] 버튼은
+        go_to_year만 호출해 화면 이동만 하고 선택 날짜는 바꾸지 않음."""
         self.go_to_today()
         return "break"
 
@@ -1841,7 +1855,7 @@ class CalendarMemoTab:
         return "break"
 
     def on_ctrl_n(self, event=None):
-        """Ctrl+N: [메모 추가] 팝업 열기 (날짜를 직접 입력해 새 메모를 시작함).
+        """Ctrl+N: [추가] 팝업 열기 (날짜를 직접 입력해 새 메모를 시작함).
         어느 서브탭(월별보기/1년전체보기/목록보기)에 있든 동일하게 동작함"""
         self._open_add_memo_dialog()
         return "break"
@@ -1912,14 +1926,15 @@ class CalendarMemoTab:
             y = int(self.month_year_var.get())
         except (ValueError, TypeError):
             y = self.cal_year
-        self.go_to_month(y, self.cal_month)
+        # 직접 입력한 연도는 지원 범위 안으로 맞춤
+        self.go_to_month(max(CAL_MIN_YEAR, min(CAL_MAX_YEAR, y)), self.cal_month)
 
     def _commit_year_year(self, event=None):
         try:
             y = int(self.year_year_var.get())
         except (ValueError, TypeError):
             y = self.cal_year_year
-        self.go_to_year(y)
+        self.go_to_year(max(CAL_MIN_YEAR, min(CAL_MAX_YEAR, y)))
 
     def _on_month_combo_change(self, event=None):
         try:
@@ -1938,18 +1953,25 @@ class CalendarMemoTab:
         while month > 12:
             month -= 12
             year += 1
+        if not (CAL_MIN_YEAR <= year <= CAL_MAX_YEAR):
+            # 지원 범위 밖으로 가는 이동(Alt+방향키 등)은 무시하고 입력창을 현재 값으로 되돌림
+            self.month_year_var.set(str(self.cal_year))
+            self.month_month_var.set(f"{self.cal_month}월")
+            return
         self.cal_year, self.cal_month = year, month
         self.render_month_view()
 
     def go_to_year(self, year):
+        if not (CAL_MIN_YEAR <= year <= CAL_MAX_YEAR):
+            self.year_year_var.set(str(self.cal_year_year))
+            return
         self.cal_year_year = year
         self.render_year_view()
 
     def go_to_today(self):
-        """[월별보기]의 "오늘" 버튼: 화면을 오늘이 있는 달로 이동함과 동시에 오늘 날짜를
-        선택하여 오른쪽 편집창도 오늘 메모로 전환한다.
-        (반면 [1년전체보기]의 "올해" 버튼은 go_to_year를 그대로 호출해 화면 이동만 하고
-        편집 중인 날짜는 바꾸지 않는다.)"""
+        """[월별보기]의 "오늘" 버튼: 오늘이 있는 달로 이동하고 오늘 날짜를 선택해 오른쪽
+        편집창도 오늘 메모로 전환한다. ([1년전체보기]의 "올해" 버튼은 go_to_year를 그대로
+        호출해 화면 이동만 하고 편집 중인 날짜는 바꾸지 않는다.)"""
         self.on_calendar_date_click(self._today_str())
 
     def on_calendar_date_click(self, date_key, redraw_list=True):
@@ -1957,6 +1979,8 @@ class CalendarMemoTab:
         (다른 달/해의 흐린 날짜를 클릭한 경우 그 달/해로 이동도 함께 처리)
         redraw_list=False는 [목록보기]에서 행을 직접 선택해 호출한 경우에 씀: 그 행은 이미
         선택되어 있고 메모 유무도 바뀌지 않으므로 목록을 다시 그릴 필요가 없음."""
+        if normalize_date_key(date_key) is None:
+            return  # 지원 연도(CAL_MIN_YEAR~CAL_MAX_YEAR) 밖의 흐린 날짜 칸
         try:
             y, m, _ = date_key.split("-")
             self.cal_year, self.cal_month = int(y), int(m)
@@ -1973,8 +1997,8 @@ class CalendarMemoTab:
         self.app.update_status_bar()
 
     def go_to_adjacent_memo_date(self, direction):
-        """[이전 메모]/[다음 메모] 버튼 및 PageUp(-1)/PageDown(+1): 메모가 있는
-        날짜 중 현재 선택된 날짜보다 이전/이후인 가장 가까운 날짜로 이동.
+        """[◀이전]/[다음▶] 버튼 및 PageUp(-1)/PageDown(+1): 메모가 있는 날짜 중 현재 선택된
+        날짜보다 이전/이후인 가장 가까운 날짜로 이동.
         (현재 선택된 날짜 자체에 메모가 없어도, 그 날짜를 기준으로 찾는다)"""
         if direction < 0:
             candidates = [d for d in self.calendar_memos if d < self.selected_date]
@@ -2015,9 +2039,8 @@ class CalendarMemoTab:
         if not self.selected_date:
             return
         had_memo = self.selected_date in self.calendar_memos
-        # 빈 날짜 판정(자동 삭제 여부)에는 .strip()으로 공백만 있는지 확인하되,
-        # 실제로 저장하는 값은 원본을 그대로 사용해 사용자가 입력한 끝줄 공백/빈
-        # 줄이 저장 시 사라지지 않도록 함 ("end-1c"는 Tk가 자동으로 붙이는 마지막
+        # 빈 날짜 판정(자동 삭제 여부)에는 .strip()으로 공백만 있는지 보되, 저장하는 값은
+        # 원본 그대로 써서 끝줄 공백/빈 줄이 사라지지 않게 함 ("end-1c"는 Tk가 붙이는 마지막
         # 개행 한 글자만 제외함)
         content = self.date_content_text.get("1.0", "end-1c")
         if content.strip():
@@ -2026,23 +2049,22 @@ class CalendarMemoTab:
             self.calendar_memos.pop(self.selected_date, None)
         self._update_remove_date_memo_button_state()
         self.app._debounced_save("calendar_memos", self.app.save_calendar_memos)
-        # 빈 날짜에 처음 메모를 쓰거나 마지막 내용을 지운 경우, 즉 "메모 있음" 여부
-        # 자체가 바뀐 경우에만 달력 칸의 진한 배경색이 바뀌므로, 그 순간에만 debounce로
-        # 달력 그리드를 다시 그림(계속 타이핑 중에는 저장과 마찬가지로 미뤄지므로,
-        # 매 키 입력마다 칸을 재생성해 버벅이는 일 없이 입력이 멈췄을 때 한 번만 반영됨)
+        # 달력 칸의 진한 배경색은 "메모 있음" 여부가 바뀔 때(빈 날짜에 처음 쓰거나 마지막
+        # 내용을 지울 때)만 달라지므로, 그 순간에만 debounce로 달력 그리드를 다시 그림
+        # (계속 타이핑하는 동안 칸을 재생성해 버벅이지 않고, 입력이 멈췄을 때 한 번만 반영됨)
         if had_memo != bool(content.strip()):
             self.app._debounced_save("calendar_view_refresh", self._refresh_calendar_views)
         self.app.update_status_bar()
 
     def _update_remove_date_memo_button_state(self):
-        """[메모 제거] 버튼(이전메모/다음메모/메모추가와 같은 공용 하단 행)을 현재
-        date_content_text 내용이 있을 때만 활성화. (Ctrl+D 단축키도 이 상태를 그대로
-        확인해서 동작 여부를 결정함)"""
+        """[제거] 버튼(공용 하단 행의 [추가]/[제거]/[◀이전]/[다음▶] 중 하나)을 현재
+        date_content_text 내용이 있을 때만 활성화. (Ctrl+D 단축키도 이 상태를 보고
+        동작 여부를 결정함)"""
         has_content = bool(self.date_content_text.get("1.0", tk.END).strip())
         self.remove_date_memo_button.config(state=(tk.NORMAL if has_content else tk.DISABLED))
 
     def remove_date_memo(self, event=None):
-        """[메모 제거] 버튼 및 Ctrl+D: 선택된 날짜의 메모 내용을 확인 후 삭제.
+        """[제거] 버튼 및 Ctrl+D: 선택된 날짜의 메모 내용을 확인 후 삭제.
         버튼이 비활성 상태(이미 내용 없음)면 아무 것도 하지 않음."""
         if str(self.remove_date_memo_button.cget("state")) != tk.NORMAL:
             return "break"
@@ -2058,10 +2080,9 @@ class CalendarMemoTab:
         """[목록보기]의 날짜 목록을 현재 메모가 있는 날짜만, 날짜순으로 다시 그림.
         [공휴일 표시] 체크박스가 켜져 있으면 holidays.json에 등록된 날짜 옆에
         "| 공휴일이름"을 덧붙임 (예: "2026-09-25 (금) | 추석")."""
-        # 다시 그리면 Listbox의 스크롤이 맨 위로 초기화되므로, 맨 위에 보이던 날짜를
-        # 기억해 두었다가 다시 그린 뒤 같은 날짜(없으면 그 다음 날짜)가 맨 위에 오게
-        # 되돌림. 행 번호가 아니라 날짜로 기억하므로, 메모가 추가/삭제되어 행 수가
-        # 바뀌어도 보던 위치가 밀리지 않음.
+        # 다시 그리면 스크롤이 맨 위로 초기화되므로, 맨 위에 보이던 날짜를 기억했다가 같은
+        # 날짜(없으면 그 다음 날짜)가 맨 위에 오게 되돌림. 행 번호가 아니라 날짜로 기억하므로
+        # 메모가 추가/삭제되어 행 수가 바뀌어도 보던 위치가 밀리지 않음.
         top_key = None
         if self.date_listbox.size() and self._date_list_keys:
             top_idx = self.date_listbox.nearest(0)
@@ -2121,12 +2142,11 @@ class CalendarMemoTab:
 
     def _on_date_list_delete(self, event=None):
         """날짜 목록에 포커스가 있을 때 Delete: 목록에서 선택한 날짜의 메모를 제거함.
-        [제거] 버튼/Ctrl+D와 똑같이 삭제 여부를 확인한 뒤 지움 (remove_date_memo 재사용).
+        [제거] 버튼/Ctrl+D와 똑같이 확인 후 지움 (remove_date_memo 재사용).
 
-        삭제 대상은 오른쪽 편집창의 날짜(selected_date)가 아니라 항상 "목록에서 선택된
-        행" 기준으로 정함. 선택된 행이 없으면 아무 것도 하지 않음 - 예를 들어 메모 없는
-        날짜에 방금 쓰기 시작해서 아직 목록에 반영되지 않은(debounce 대기 중) 상태에서
-        Delete를 눌러도, 목록에 보이지도 않는 날짜의 메모가 지워지는 일이 없도록 함."""
+        삭제 대상은 오른쪽 편집창의 날짜(selected_date)가 아니라 항상 "목록에서 선택된 행"
+        기준임. 선택된 행이 없으면 아무 것도 하지 않아, 방금 쓰기 시작해서 아직 목록에 반영되지
+        않은(debounce 대기 중) 날짜의 메모가 지워지는 일이 없도록 함."""
         sel = self.date_listbox.curselection()
         if not sel or not (0 <= sel[0] < len(self._date_list_keys)):
             return "break"
@@ -2141,10 +2161,8 @@ class CalendarMemoTab:
         # 쓸 수 있도록 함
         self.date_listbox.focus_set()
         if date_key not in self.calendar_memos and self.date_listbox.size():
-            # 지운 뒤 목록이 다시 그려지면서 활성(active) 항목과 스크롤 위치가 맨 위로
-            # 초기화되므로, 삭제한 자리로 되돌림. 이걸 안 하면 이어서 ↑↓를 눌렀을 때
-            # 목록 맨 위 근처로 튀고, 긴 목록에서는 보던 위치를 잃어버림.
-            # (선택은 하지 않음 - [제거] 버튼/Ctrl+D와 지운 뒤 상태를 같게 유지)
+            # 지운 뒤 목록이 다시 그려지면 활성(active) 항목과 스크롤이 맨 위로 초기화되므로
+            # 삭제한 자리로 되돌림 (선택은 하지 않음 - [제거] 버튼/Ctrl+D와 지운 뒤 상태를 같게 유지)
             near = min(idx, self.date_listbox.size() - 1)
             self.date_listbox.activate(near)
             self.date_listbox.see(near)
@@ -2162,9 +2180,9 @@ class CalendarMemoTab:
         return "break"
 
     def _open_add_memo_dialog(self, event=None):
-        """[메모 추가] 버튼 및 Ctrl+N: 날짜를 직접 입력해 그 날짜로 이동함.
-        (실제 메모 항목은 이 창이 아니라, 이동한 뒤 오른쪽 편집창에 내용을 입력해야
-        생김 - 달력메모는 내용이 있어야만 "메모가 있다"고 취급하는 기존 규칙과 동일)"""
+        """[추가] 버튼 및 Ctrl+N: 날짜를 직접 입력해 그 날짜로 이동함.
+        (실제 메모 항목은 이동한 뒤 오른쪽 편집창에 내용을 입력해야 생김 - 달력메모는
+        내용이 있어야만 "메모가 있다"고 취급함)"""
         dialog = Toplevel(self.app.root)
         dialog.title("메모 추가")
         dialog.resizable(False, False)
@@ -2187,9 +2205,9 @@ class CalendarMemoTab:
                 d = date.today()
             date_var.set((d + timedelta(days=delta)).strftime("%Y-%m-%d"))
 
-        # ttk.Spinbox의 기본 클래스 바인딩이 <<Increment>>/<<Decrement>>에서 텍스트를
-        # 숫자로 취급해 자체적으로 증감을 시도하므로(break 없음), 날짜 문자열을 다시
-        # 덮어쓰지 못하게 반드시 "break"로 막아야 함 (Ctrl+Shift+D 팝업과 동일한 패턴)
+        # ttk.Spinbox의 기본 클래스 바인딩은 <<Increment>>/<<Decrement>>에서 텍스트를 숫자로
+        # 취급해 스스로 증감을 시도하므로(break 없음), 방금 넣은 날짜 문자열을 덮어쓰지 못하게
+        # 반드시 "break"로 막아야 함
         def on_increment(e=None):
             adjust_date(1)
             return "break"
@@ -2202,11 +2220,11 @@ class CalendarMemoTab:
         date_spin.bind("<<Decrement>>", on_decrement)
 
         def on_confirm(event=None):
-            raw = date_var.get().strip()
-            try:
-                date_key = datetime.strptime(raw, "%Y-%m-%d").date().strftime("%Y-%m-%d")
-            except ValueError:
-                messagebox.showerror("오류", "날짜를 YYYY-MM-DD 형식으로 입력하세요.", parent=dialog)
+            date_key = normalize_date_key(date_var.get())
+            if date_key is None:
+                messagebox.showerror(
+                    "오류", f"날짜를 YYYY-MM-DD 형식({CAL_MIN_YEAR}~{CAL_MAX_YEAR}년)으로 입력하세요.",
+                    parent=dialog)
                 return
             already_exists = date_key in self.calendar_memos
             dialog.destroy()
@@ -2264,11 +2282,9 @@ class CalendarMemoTab:
         for d in range(1, trailing + 1):
             cells.append((d, f"{next_year:04d}-{next_month:02d}-{d:02d}", True))
 
-        # 0열은 1년전체보기와 폭을 맞추기 위해 비워두는 칸인데, month_grid_frame 자체의
-        # 배경색이 격자선 효과를 위해 border색(회색 계열)으로 칠해져 있어(apply_theme_colors
-        # 참고) 그 위에 아무 위젯도 없으면 이 칸만 세로로 긴 회색 사각형처럼 보이는 문제가
-        # 있었음. 1년전체보기가 이 칸에 월 숫자 라벨을 채우는 것과 같은 방식으로, 패널
-        # 배경색(bg)의 빈 라벨을 각 행 0열에 채워 넣어 폭은 유지하면서 티 나지 않게 함
+        # 0열은 1년전체보기와 폭을 맞추기 위한 빈 칸임. month_grid_frame 배경은 격자선 효과를
+        # 위해 border색(회색)이라 아무 위젯도 없으면 이 칸만 회색 사각형으로 보이므로, 패널
+        # 배경색(bg)의 빈 라벨을 각 행 0열에 채워 넣음 (1년전체보기가 월 숫자 라벨을 채우는 것과 같은 방식)
         colors = THEME_COLORS.get(self.app.settings_mgr.theme_mode, THEME_COLORS["light"])
         num_rows = len(cells) // 7
         for row in range(num_rows):
@@ -2347,8 +2363,8 @@ class CalendarMemoTab:
         canvas.grid(row=row, column=col, sticky="nsew", padx=1, pady=1)
 
         holiday_name = self.holidays.get(date_key)
-        # 흐리게 표시되는 다른 달 날짜("other")는 일요일/토요일도 특별 색을 안 쓰는
-        # 기존 규칙과 똑같이, 공휴일이어도 색을 강조하지 않음(시각적 일관성 유지)
+        # 흐리게 표시되는 다른 달 날짜("other")는 일요일/토요일도 특별 색을 쓰지 않으므로,
+        # 공휴일이어도 색을 강조하지 않음 (시각적 일관성)
         if kind == "other":
             fg = colors["muted_fg"]
             holiday_name = None
@@ -2403,9 +2419,9 @@ class CalendarMemoTab:
             self._holiday_tooltip.destroy()
             self._holiday_tooltip = None
 
-    # ---- 전용 단축키 (Alt+M/Y/좌우, Ctrl+Shift+D) ----
-    # (아래 네 메서드는 MemoApp이 "달력메모 탭이 활성화되어 있을 때만" 호출해주므로,
-    # 예전과 달리 이 메서드들 스스로 활성 탭을 확인할 필요가 없음)
+    # ---- 전용 단축키 (Alt+M/Y/L, Alt+←/→, Ctrl+Shift+D) ----
+    # (아래 메서드들은 MemoApp이 "달력메모 탭이 활성화되어 있을 때만" 호출하므로 스스로
+    # 활성 탭을 확인할 필요가 없음)
 
     def on_alt_m(self, event=None):
         """Alt+M: [월별보기] 서브탭 활성화
@@ -2471,9 +2487,7 @@ class CalendarMemoTab:
                 d = date.today() - timedelta(days=1)
             date_var.set((d + timedelta(days=delta)).strftime("%Y-%m-%d"))
 
-        # ttk.Spinbox의 기본 클래스 바인딩(TSpinbox)이 <<Increment>>/<<Decrement>>에서
-        # 텍스트를 숫자로 취급해 자체적으로 증감을 시도하는데(break 없음), 그대로 두면
-        # 우리가 막 넣은 날짜 문자열을 다시 덮어써버려서(예: "0") "break"로 반드시 막아야 함
+        # <<Increment>>/<<Decrement>>의 기본 증감을 "break"로 막는 이유는 [추가] 팝업과 같음
         def on_increment(e=None):
             adjust_date(1)
             return "break"
@@ -2532,11 +2546,12 @@ class CalendarMemoTab:
         """memos_calendar.json과 같은 {"YYYY-MM-DD": "내용"} 형태인지 검증 (잘못되면 TypeError/ValueError)"""
         if not isinstance(raw, dict):
             raise TypeError('데이터가 {"날짜": "내용"} 형태의 딕셔너리가 아닙니다.')
-        for k, v in raw.items():
-            datetime.strptime(k, "%Y-%m-%d")  # 날짜 형식(YYYY-MM-DD) 검증
-            if not isinstance(v, str):
-                raise ValueError("일부 항목의 내용이 문자열이 아닙니다.")
-        return dict(raw)
+        memos, skipped = normalize_calendar_memos(raw)
+        if skipped:
+            raise ValueError(
+                f"날짜(YYYY-MM-DD, {CAL_MIN_YEAR}~{CAL_MAX_YEAR}년) 형식이 아니거나 내용이 문자열이 아닌 "
+                f"항목이 있습니다: {skipped[0]!r}")
+        return memos
 
     def transfer_summary(self, data):
         return f"메모 {len(data)}개"
@@ -2569,12 +2584,11 @@ class CalendarMemoTab:
 
 
 # ============================================================================
-# "컬렉션" 탭 — 예전 "엣지 컬렉션 매니저"의 핵심 기능(컬렉션/항목 CRUD, URL 제목
-# 자동 수집, 순서 변경)을 옮긴 부분. 이미지 첨부·미리보기 기능은 포함하지 않음.
+# "컬렉션" 탭 (컬렉션/항목 CRUD, URL 제목 자동 수집, 순서 변경)
 # ============================================================================
 
 class TitleFetcher:
-    """별도 스레드에서 URL의 <title>을 가져와 큐에 결과를 전달함 (이미지 자동 수집 없음).
+    """별도 스레드에서 URL의 <title>을 가져와 큐에 결과를 전달함.
 
     제목 추출 순서
     -------------
@@ -2709,7 +2723,7 @@ class TitleFetcher:
 
 
 class EditItemDialog(tk.Toplevel):
-    """항목(링크/메모) 편집 창: 제목/URL/메모 세 필드만 편집함 (이미지 첨부 기능 없음)."""
+    """항목(링크/메모) 편집 창: 제목/URL/메모 세 필드를 편집함."""
 
     def __init__(self, parent, item, on_save, content_font, colors):
         super().__init__(parent)
@@ -2767,6 +2781,10 @@ class EditItemDialog(tk.Toplevel):
             return
         if url:
             url = normalize_url(url)
+            if not is_web_url(url):
+                messagebox.showwarning(
+                    "입력 오류", "URL은 http:// 또는 https:// 웹 주소만 입력할 수 있습니다.", parent=self)
+                return
         self.on_save(title or url, url, memo)
         self.destroy()
 
@@ -2868,7 +2886,7 @@ def load_shortcut_guide():
     """shortcuts.md를 읽어 (블록 목록, 오류 메시지)를 반환함. 성공하면 오류 메시지는 None.
     파일이 없거나 읽을 수 없거나 내용이 비어 있으면 블록 목록이 비고 오류 메시지가 채워짐
     (안내 창이 예외로 죽는 대신 그 이유를 창 안에 보여주기 위함).
-    UTF-8(BOM 유무 무관)로 읽고, 실패하면 옛 메모장의 기본 저장 방식인 CP949로 다시 시도함."""
+    UTF-8(BOM 유무 무관)로 읽고, 실패하면 CP949로 다시 시도함."""
     path = shortcuts_file_path()
     if not os.path.isfile(path):
         return [], (f"단축키 안내 파일({SHORTCUTS_FILE_NAME})을 찾을 수 없습니다.\n\n"
@@ -3027,19 +3045,16 @@ class ChecklistTab:
     """"체크리스트" 탭: 왼쪽에 폴더(쇼핑리스트/할일 등 분류) 목록, 오른쪽에 선택된
     폴더의 체크리스트 항목([상태|내용]) 목록을 보여줌.
 
-    UI와 조작 방식은 "컬렉션" 탭(CollectionTab)을 그대로 가져와 활용하되, 항목이
-    URL/메모가 아니라 완료 여부(상태)와 내용만 가지므로 그에 맞게 단순화함:
-      - 항목 목록은 [상태(☑/☐)|내용] 2열 고정 (컬렉션처럼 URL 열을 숨겼다 보였다
-        하는 반응형 로직이 필요 없음)
-      - URL 제목 자동 수집(TitleFetcher)이나 링크 열기처럼 URL 전용 기능은
-        해당 사항이 없어 포함하지 않음
-      - Space는 컬렉션에서 "편집 창 열기"였지만 체크리스트에서는 요구사항에 따라
-        "완료 여부 토글"로 재정의함. 대신 내용 수정은 F2/더블클릭으로 함
-      - 컬렉션의 컬렉션(폴더) 쪽 동작(추가/이름변경/삭제/순서변경/드래그)과
-        항목 쪽 동작(추가/삭제/순서변경/드래그/인라인편집/포커스 복원)은 이름만
-        "폴더"에 맞게 바꿔 동일하게 준용함
-      - 오른쪽 하단의 [클립보드로 복사]는 선택한 항목을 "[v] 내용"(완료) 또는
-        "[ ] 내용"(미완료) 한 줄로 복사함. 선택한 항목이 없으면 버튼이 비활성화됨
+    UI와 조작 방식은 "컬렉션" 탭(CollectionTab)과 같고, 항목이 URL/메모가 아니라
+    완료 여부(상태)와 내용만 가진다는 점이 다름:
+      - 항목 목록은 [상태(☑/☐)|내용] 2열 고정 (URL 열이 없으므로 컬렉션 같은 반응형 열
+        전환이 필요 없음)
+      - URL 제목 자동 수집이나 링크 열기 같은 URL 전용 기능은 없음
+      - Space는 "완료 여부 토글"임 (컬렉션에서는 편집 창 열기). 내용 수정은 F2/더블클릭
+      - 폴더 쪽 동작(추가/이름변경/삭제/순서변경/드래그)과 항목 쪽 동작(추가/삭제/순서변경/
+        드래그/인라인편집/포커스 복원)은 컬렉션 탭과 같은 방식임
+      - 오른쪽 하단의 [클립보드로 복사]는 선택한 항목을 "[v] 내용"(완료) 또는 "[ ] 내용"
+        (미완료) 한 줄로 복사함. 선택한 항목이 없으면 버튼이 비활성화됨
     """
 
     def __init__(self, parent, app):
@@ -3138,13 +3153,9 @@ class ChecklistTab:
 
         # ---- 오른쪽 하단: [클립보드로 복사] 버튼 ----
         # 일반메모 탭과 같은 배치: 탭 전체 폭의 별도 줄이 아니라 "오른쪽 패널의 맨 아래 줄"로 둠.
-        # 그래야 왼쪽 목록의 [추가/제거/▲/▼] 줄(왼쪽 패널의 맨 아래 줄)과 같은 높이에 나란히
-        # 놓이고, 두 줄이 모두 창 맨 아래까지 내려가 낭비되는 공간이 생기지 않음 (탭 전체 폭의
-        # 줄로 만들면 왼쪽 버튼 줄이 그 위로 밀려 올라가고 그 아래가 빈 공간이 됨).
-        # pack(before=items_container): 항목 목록보다 먼저 공간을 받도록 pack 순서만 앞에 둠.
-        # pack은 먼저 pack한 위젯에게 공간을 먼저 나눠주므로, 창이 작아져 공간이 모자라도
-        # (800×600 최소 크기 등) 버튼이 아니라 항목 목록이 줄어들고 버튼은 가려지지 않음.
-        # 반면 위젯은 항목 목록 뒤에 만들었으므로 Tab 키 이동 순서는 목록들 다음, 즉 마지막임
+        # 그래야 왼쪽 목록의 [추가/제거/▲/▼] 줄과 같은 높이에 나란히 놓여 빈 공간이 생기지 않음.
+        # pack(before=items_container): 항목 목록보다 먼저 공간을 받게 해서, 창이 작아져도 버튼이
+        # 아니라 항목 목록이 줄어듦. (위젯은 목록 뒤에 만들었으므로 Tab 이동 순서는 마지막임)
         copy_bar = ttk.Frame(right_panel)
         copy_bar.pack(side=tk.BOTTOM, fill=tk.X, pady=5, before=items_container)
         self.copy_button = ttk.Button(copy_bar, text="클립보드로 복사", command=self.app.copy_to_clipboard)
@@ -3165,10 +3176,9 @@ class ChecklistTab:
         self.folder_listbox.bind("<ButtonPress-1>", self._on_folder_press, add="+")
         self.folder_listbox.bind("<B1-Motion>", self._on_folder_motion, add="+")
         self.folder_listbox.bind("<ButtonRelease-1>", self._on_folder_release, add="+")
-        # 폴더 목록의 키 단축키는 전부 bind_when_visible로 걺: 폴더 목록에 포커스가 있고
-        # 화면에 보일 때만 동작함 (다른 탭으로 전환한 뒤에도 포커스는 안 보이는 목록에
-        # 남아 있으므로, 이 가드가 없으면 다른 탭에서 누른 PageUp/Delete가 안 보이는
-        # 폴더에 적용됨)
+        # 폴더 목록의 키 단축키는 전부 bind_when_visible로 걺: 포커스가 있고 화면에 보일 때만
+        # 동작함 (다른 탭으로 전환해도 포커스는 안 보이는 목록에 남아 있어, 가드가 없으면 다른
+        # 탭에서 누른 PageUp/Delete가 안 보이는 폴더에 적용됨)
         bind_when_visible(self.folder_listbox, "<Delete>", lambda e: self._delete_folder())
         bind_when_visible(self.folder_listbox, "<Prior>", self._on_folder_page_up)
         bind_when_visible(self.folder_listbox, "<Next>", self._on_folder_page_down)
@@ -3353,7 +3363,7 @@ class ChecklistTab:
 
     def on_ctrl_n(self, event=None):
         """Ctrl+N: 입력창에 내용이 있으면 그대로 새 항목으로 추가하고, 비어있으면
-        (컬렉션의 별도 다이얼로그에 대응하는 동작이 없으므로) 입력창에 포커스만 이동함"""
+        입력창에 포커스만 이동함 (컬렉션 탭의 항목 편집 창에 해당하는 것은 없음)"""
         if self.add_entry.get().strip():
             self._on_add_submit()
         else:
@@ -3802,9 +3812,9 @@ class ChecklistTab:
         if not self._inline_editor or not self._inline_edit_row_id:
             return
         row_id = self._inline_edit_row_id
-        # 편집을 시작한 폴더. 편집 중에 다른 폴더를 클릭하면 폴더 선택이 먼저 바뀐 뒤에
-        # (<<ListboxSelect>> -> _refresh_items) 그 안에서 편집이 확정되므로, 확정 시점의
-        # 선택 폴더로 항목을 찾으면 엉뚱한 폴더를 뒤져서 편집이 조용히 버려졌음
+        # 편집을 시작한 폴더. 편집 중에 다른 폴더를 클릭하면 폴더 선택이 먼저 바뀐 뒤
+        # (<<ListboxSelect>> -> _refresh_items) 그 안에서 편집이 확정되므로, 확정 시점의 선택
+        # 폴더로 항목을 찾으면 엉뚱한 폴더를 뒤져 편집이 버려짐. 그래서 시작한 폴더 id로 찾음
         edit_fid = self._inline_edit_folder_id
         new_value = self._inline_editor.get().strip()
         editor = self._inline_editor
@@ -3920,18 +3930,13 @@ class ChecklistTab:
 class CollectionTab:
     """"컬렉션" 탭: 왼쪽 컬렉션(폴더) 목록 + 오른쪽 선택된 컬렉션의 항목(링크/메모) 목록.
 
-    예전에 별도 프로그램("엣지 컬렉션 매니저")이었던 것의 핵심 기능을 옮기되, 이 앱의
-    800×600 최소 크기에 맞춰 UI를 다음과 같이 단순화함:
-      - URL 입력창과 메모 입력창을 하나로 합치고, 입력값이 URL처럼 보이면 자동으로
-        링크 항목으로, 아니면 메모 항목으로 추가함 (Ctrl+N을 누르면 제목/URL/메모를
-        한 번에 입력하는 편집 창이 뜸 - 두 방법을 상황에 맞게 선택해서 사용)
-      - 항목 목록은 창이 좁으면 [제목/메모] 2열, 넓어지면 [제목/URL/메모] 3열로
-        자동 전환됨 (URL이 있는 항목은 좁을 때도 제목 앞에 🔗로 표시)
-      - 값이 비어있는 칸을 회색 "<값 없음>"으로 표시하던 오버레이는 제거함(그냥
-        빈 칸으로 표시) - 컬럼이 자동으로 늘었다 줄었다 하는 것과 함께 쓰면
-        오버레이 위치를 매번 다시 계산해야 해서 복잡함에 비해 얻는 게 적음
-      - 이미지 첨부/미리보기 기능은 포함하지 않음. requests가 설치되어 있으면
-        URL 제목 자동 수집은 그대로 동작함
+    800×600 최소 크기에 맞춘 UI:
+      - URL 입력창과 메모 입력창이 하나이며, 입력값이 URL처럼 보이면 링크 항목으로,
+        아니면 메모 항목으로 추가함 (Ctrl+N을 누르면 제목/URL/메모를 한 번에 입력하는
+        편집 창이 뜸 - 상황에 맞게 선택해서 사용)
+      - 항목 목록은 창이 좁으면 [제목/메모] 2열, 넓어지면 [제목/URL/메모] 3열로 자동
+        전환됨 (URL이 있는 항목은 좁을 때도 제목 앞에 🔗로 표시)
+      - requests가 설치되어 있으면 URL 제목을 자동으로 가져옴 (이미지 첨부는 지원하지 않음)
       - 오른쪽 하단의 [클립보드로 복사]는 선택한 항목을 "제목: ... / URL: ... / 메모: ..."
         세 줄로 복사함. 선택한 항목이 없으면 버튼이 비활성화됨
     """
@@ -4052,14 +4057,8 @@ class CollectionTab:
         items_vsb.grid(row=0, column=1, sticky="ns")
 
         # ---- 오른쪽 하단: [클립보드로 복사] 버튼 ----
-        # 일반메모 탭과 같은 배치: 탭 전체 폭의 별도 줄이 아니라 "오른쪽 패널의 맨 아래 줄"로 둠.
-        # 그래야 왼쪽 목록의 [추가/제거/▲/▼] 줄(왼쪽 패널의 맨 아래 줄)과 같은 높이에 나란히
-        # 놓이고, 두 줄이 모두 창 맨 아래까지 내려가 낭비되는 공간이 생기지 않음 (탭 전체 폭의
-        # 줄로 만들면 왼쪽 버튼 줄이 그 위로 밀려 올라가고 그 아래가 빈 공간이 됨).
-        # pack(before=items_container): 항목 목록보다 먼저 공간을 받도록 pack 순서만 앞에 둠.
-        # pack은 먼저 pack한 위젯에게 공간을 먼저 나눠주므로, 창이 작아져 공간이 모자라도
-        # (800×600 최소 크기 등) 버튼이 아니라 항목 목록이 줄어들고 버튼은 가려지지 않음.
-        # 반면 위젯은 항목 목록 뒤에 만들었으므로 Tab 키 이동 순서는 목록들 다음, 즉 마지막임
+        # 체크리스트 탭과 같은 배치: 오른쪽 패널의 맨 아래 줄. pack(before=items_container)로
+        # 창이 작아져도 버튼이 아니라 항목 목록이 줄어들게 함 (자세한 이유는 ChecklistTab 참고)
         copy_bar = ttk.Frame(right_panel)
         copy_bar.pack(side=tk.BOTTOM, fill=tk.X, pady=5, before=items_container)
         self.copy_button = ttk.Button(copy_bar, text="클립보드로 복사", command=self.app.copy_to_clipboard)
@@ -4081,10 +4080,7 @@ class CollectionTab:
         self.collection_listbox.bind("<ButtonPress-1>", self._on_collection_press, add="+")
         self.collection_listbox.bind("<B1-Motion>", self._on_collection_motion, add="+")
         self.collection_listbox.bind("<ButtonRelease-1>", self._on_collection_release, add="+")
-        # 컬렉션 목록의 키 단축키는 전부 bind_when_visible로 걺: 컬렉션 목록에 포커스가
-        # 있고 화면에 보일 때만 동작함 (다른 탭으로 전환한 뒤에도 포커스는 안 보이는
-        # 목록에 남아 있으므로, 이 가드가 없으면 다른 탭에서 누른 PageUp/Delete가 안
-        # 보이는 컬렉션에 적용됨)
+        # 컬렉션 목록의 키 단축키도 전부 bind_when_visible (이유는 ChecklistTab의 폴더 목록과 같음)
         bind_when_visible(self.collection_listbox, "<Delete>", lambda e: self._delete_collection())
         # PageUp/PageDown: 컬렉션 순서 이동. items_tree의 PageUp/PageDown과 마찬가지로
         # 이 위젯에만 직접 바인딩해서, 포커스가 컬렉션 목록에 있을 때는 컬렉션 순서를,
@@ -4112,9 +4108,8 @@ class CollectionTab:
         # 아무 일도 일어나지 않게 함 - 다른 탭의 PageUp/PageDown과 서로 간섭하지 않음
         bind_when_visible(self.items_tree, "<Prior>", self._on_item_page_up)
         bind_when_visible(self.items_tree, "<Next>", self._on_item_page_down)
-        # Home/End: 항목 목록(오른쪽)의 첫/마지막 항목으로 이동 (항목 목록에 포커스가 있을
-        # 때만 동작함. 제목 인라인 편집창(Entry)은 items_tree의 자식 위젯이라 이
-        # 바인딩을 거치지 않으므로 편집 중의 Home/End는 그대로 편집창 커서 이동임)
+        # Home/End: 항목 목록(오른쪽)의 첫/마지막 항목으로 이동 (제목 인라인 편집창은 자식
+        # 위젯이라 이 바인딩을 거치지 않으므로 편집 중의 Home/End는 편집창 커서 이동임)
         bind_when_visible(self.items_tree, "<Home>", self._on_item_home)
         bind_when_visible(self.items_tree, "<End>", self._on_item_end)
         # 제목 앞 🔗 아이콘에 마우스를 올리면 URL을 풍선말로 보여줌
@@ -4272,11 +4267,9 @@ class CollectionTab:
     def on_activated(self, event=None):
         if not self._sash_initialized:
             # 탭이 실제로 화면에 처음 보이는 시점에 sash 위치를 잡음. 창 시작 시
-            # (restore_window_geometry에서) 바로 시도하면, 이 시점엔 컬렉션 탭이
-            # 아직 숨겨진 노트북 페이지라 크기가 확정되지 않아 sashpos()가 반영되지
-            # 않고 왼쪽 패널이 거의 0px로 무너지는 문제가 있었음 (800×600 최소
-            # 크기에서 항목 목록이 실제보다 넓어져, URL 열이 숨겨져야 할 때도
-            # 표시되는 원인이 되었음).
+            # (restore_window_geometry)에는 이 탭이 아직 숨겨진 노트북 페이지라 크기가 확정되지
+            # 않아 sashpos()가 반영되지 않고 왼쪽 패널이 0px 가까이로 무너짐 (최소 크기에서 URL
+            # 열이 숨겨져야 할 때도 보이는 원인이 됨)
             self._sash_initialized = True
             try:
                 self.app.root.update_idletasks()
@@ -4300,8 +4293,7 @@ class CollectionTab:
 
     def _enforce_min_sash(self):
         # 일반메모 탭(GeneralMemoTab.enforce_min_sash)과 같은 값. 추가/제거/▲/▼
-        # 버튼 4개의 실제 필요 폭이 두 탭에서 동일(174px)해서 같은 여유(200px)를 둠 -
-        # 이전에 160으로 너무 낮게 잡아서 사용자가 경계선을 끝까지 밀면 버튼이 잘렸었음
+        # 버튼 4개의 실제 필요 폭이 두 탭에서 동일(174px)해서 같은 여유(200px)를 둠
         try:
             if self.main_pane.sashpos(0) < 200:
                 self.main_pane.sashpos(0, 200)
@@ -4312,9 +4304,8 @@ class CollectionTab:
 
     def on_ctrl_n(self, event=None):
         """Ctrl+N: 제목/URL/메모를 한 번에 입력하는 편집 창을 새 항목으로 엶.
-        (입력창에 텍스트를 타이핑하고 Enter/추가 버튼을 누르는 빠른 방법은 이미
-        있으므로, Ctrl+N은 여러 필드를 한 번에 채우고 싶을 때 쓰는 경로로 분리함.
-        예전 버전의 Ctrl+N(새 컬렉션)은 Ctrl+Shift+N으로 옮김)"""
+        (입력창에 타이핑하고 Enter/추가 버튼을 누르는 빠른 방법과 별개로, 여러 필드를 한 번에
+        채우고 싶을 때 쓰는 경로임. 새 컬렉션은 Ctrl+Shift+N)"""
         cid = self._get_selected_collection_id()
         if not cid:
             messagebox.showinfo("컬렉션 선택", "먼저 왼쪽에서 컬렉션을 선택하거나 새로 만들어주세요.", parent=self.app.root)
@@ -4532,9 +4523,8 @@ class CollectionTab:
         restore_listbox_top(self.collection_listbox, old_ids, old_top, self._collection_id_by_index)
         if select_index is not None and 0 <= select_index < len(self._collection_id_by_index):
             self.collection_listbox.selection_set(select_index)
-            # selection_set()은 "선택 표시"만 하고, 방향키 탐색의 기준이 되는
-            # "활성(active)" 인덱스는 바꾸지 않아서 이 호출을 빼먹으면 PageUp/PageDown으로
-            # 순서를 바꾼 뒤 방향키를 눌렀을 때 엉뚱하게 0번째 근처로 튀는 문제가 있었음
+            # selection_set()은 선택 표시만 하고 방향키 탐색 기준인 "활성(active)" 인덱스는 바꾸지
+            # 않으므로, 이 호출이 없으면 PageUp/PageDown으로 순서를 바꾼 뒤 방향키가 0번째 근처로 튐
             self.collection_listbox.activate(select_index)
             self.collection_listbox.see(select_index)
         self._refresh_items(select_item_id=select_item_id)
@@ -4546,9 +4536,8 @@ class CollectionTab:
             new_col = self._add_collection(name.strip(), after_id=current_id)
             self._refresh_collections(select_id=new_col["id"])
             self.app.show_status_message(f"'{name.strip()}' 컬렉션을 만들었습니다.")
-        # simpledialog(모달 Toplevel)가 닫힌 뒤에는 키보드 포커스가 어디로도 돌아오지
-        # 않아 방향키로 컬렉션 목록을 탐색할 수 없게 되는 문제가 있었음 - 목록에 포커스를
-        # 명시적으로 되돌려줌 (취소했을 때도 동일하게 적용)
+        # simpledialog(모달 Toplevel)가 닫힌 뒤에는 키보드 포커스가 돌아오지 않아 방향키로 목록을
+        # 탐색할 수 없으므로 목록에 포커스를 명시적으로 되돌림 (취소했을 때도 동일)
         self.collection_listbox.focus_set()
 
     def _rename_collection(self):
@@ -4562,8 +4551,8 @@ class CollectionTab:
         if new_name and new_name.strip():
             self._rename_collection_data(cid, new_name.strip())
             self._refresh_collections()
-        # simpledialog가 닫힌 뒤 포커스가 유실되어 방향키 탐색이 안 되는 문제 수정
-        # (F2로 이름 변경 후에도 바로 이어서 위/아래로 다른 컬렉션을 탐색할 수 있어야 함)
+        # simpledialog가 닫힌 뒤 포커스가 유실되지 않도록 목록에 되돌림
+        # (F2로 이름 변경한 뒤 바로 위/아래로 다른 컬렉션을 탐색할 수 있어야 함)
         self.collection_listbox.focus_set()
 
     def _delete_collection(self):
@@ -4706,9 +4695,8 @@ class CollectionTab:
                 self.items_tree.insert("", "end", iid=item["id"], values=self._item_row_values(item))
             if select_item_id and self.items_tree.exists(select_item_id):
                 self.items_tree.selection_set(select_item_id)
-                # selection_set()만으로는 방향키 탐색 기준이 되는 "포커스(focus)" 항목이
-                # 바뀌지 않아, PageUp/PageDown으로 순서를 바꾼 뒤 방향키로 다른 항목으로
-                # 옮겨가지 못하는 문제가 있었음 (Listbox의 activate()에 대응하는 Treeview의 개념)
+                # selection_set()만으로는 방향키 탐색 기준인 "포커스(focus)" 항목이 바뀌지 않으므로
+                # focus()도 지정함 (Listbox의 activate()에 대응하는 Treeview의 개념)
                 self.items_tree.focus(select_item_id)
                 self.items_tree.see(select_item_id)
         # 목록을 다시 그리면 선택이 바뀌므로(없어지거나 select_item_id로 복원됨) 버튼 상태도 맞춤
@@ -4785,7 +4773,15 @@ class CollectionTab:
         if not url:
             self.app.show_status_message("메모 항목에는 열 수 있는 링크가 없습니다.")
             return
-        webbrowser.open(url)
+        if not is_web_url(url):
+            self.app.show_status_message("http/https 웹 주소만 열 수 있습니다. 항목 편집에서 URL을 확인해 주세요.")
+            return
+        try:
+            opened = webbrowser.open(url.strip())
+        except Exception:
+            opened = False
+        if not opened:
+            self.app.show_status_message("웹 브라우저를 열지 못했습니다.")
 
     def _edit_selected_item(self):
         cid = self._get_selected_collection_id()
@@ -4966,9 +4962,9 @@ class CollectionTab:
         if not self._inline_editor or not self._inline_edit_row_id:
             return
         row_id = self._inline_edit_row_id
-        # 편집을 시작한 컬렉션. 편집 중에 다른 컬렉션을 클릭하면 컬렉션 선택이 먼저 바뀐 뒤에
-        # (<<ListboxSelect>> -> _refresh_items) 그 안에서 편집이 확정되므로, 확정 시점의
-        # 선택 컬렉션으로 항목을 찾으면 엉뚱한 컬렉션을 뒤져서 편집이 조용히 버려졌음
+        # 편집을 시작한 컬렉션. 편집 중에 다른 컬렉션을 클릭하면 컬렉션 선택이 먼저 바뀐 뒤
+        # (<<ListboxSelect>> -> _refresh_items) 그 안에서 편집이 확정되므로, 확정 시점의 선택
+        # 컬렉션으로 항목을 찾으면 엉뚱한 컬렉션을 뒤져 편집이 버려짐. 그래서 시작한 컬렉션 id로 찾음
         edit_cid = self._inline_edit_collection_id
         new_value = self._inline_editor.get().strip()
         editor = self._inline_editor
@@ -4984,9 +4980,9 @@ class CollectionTab:
         except tk.TclError:
             pass
         if editor_had_focus:
-            # 편집창이 사라진 뒤 포커스가 어디로도 옮겨가지 않아 방향키로 항목 목록을
-            # 탐색할 수 없게 되는 문제가 있었음 - 항목 목록으로 포커스를 되돌림
-            # (다른 위젯을 클릭해 편집을 끝낸 경우는 그 포커스 이동을 존중해 건드리지 않음)
+            # 편집창이 사라진 뒤 포커스가 어디로도 가지 않으면 방향키로 항목 목록을 탐색할 수
+            # 없으므로 항목 목록으로 되돌림 (다른 위젯을 클릭해 편집을 끝낸 경우는 그 포커스
+            # 이동을 존중해 건드리지 않음)
             self.items_tree.focus_set()
         if not new_value:
             self.app.show_status_message("제목은 비워둘 수 없어 변경하지 않았습니다.")
@@ -5021,7 +5017,7 @@ class CollectionTab:
 
     def transfer_parse(self, raw):
         """collections.json과 같은 {"collections": [...]} 형태인지 검증하고 정규화함
-        (잘못되면 TypeError/ValueError). 예전 \"엣지 컬렉션 매니저\"의 파일도 읽을 수 있음."""
+        (잘못되면 TypeError/ValueError). "엣지 컬렉션 매니저"가 만든 파일도 읽을 수 있음."""
         if not isinstance(raw, dict) or not isinstance(raw.get("collections"), list):
             raise TypeError('데이터가 {"collections": [...]} 형태가 아닙니다.')
         cleaned = []
@@ -5087,7 +5083,7 @@ class CollectionTab:
 class MemoApp:
     """최상위 지휘자: 메뉴, 전역 단축키, 창 생명주기, 테마/상태표시줄처럼 여러
     탭을 넘나드는 것만 여기 남기고, 각 탭 자체의 UI/데이터/동작은
-    GeneralMemoTab / CalendarMemoTab / CollectionTab에 위임함."""
+    GeneralMemoTab / CalendarMemoTab / ChecklistTab / CollectionTab에 위임함."""
 
     def __init__(self, root):
         self.root = root
@@ -5110,20 +5106,18 @@ class MemoApp:
         # 계속되는 동안 키 입력마다 반복해서 오류 팝업이 뜨지 않도록, 이미 알린
         # key는 그 저장이 다시 성공하기 전까지는 조용히 넘어감
         self._save_failed_keys = set()
-        # 상태표시줄에 임시 메시지(예: 컬렉션 탭의 "제목을 가져오는 중...")를 띄울 때
-        # 그 메시지가 몇 번째로 예약된 것인지 구분하는 일련번호. 메시지가 사라지기
-        # 전에 또 다른 임시 메시지가 뜨면, 먼저 예약된 메시지의 "원래대로 복귀" 타이머가
-        # 나중 메시지를 덮어쓰지 않도록 이 번호로 자신이 아직 "최신"인지 확인함
+        # 상태표시줄 임시 메시지(예: 컬렉션 탭의 "제목을 가져오는 중...")의 일련번호. 먼저 예약된
+        # 메시지의 "원래대로 복귀" 타이머가 나중 메시지를 덮어쓰지 않도록, 자신이 아직 최신인지
+        # 이 번호로 확인함
         self._status_msg_token = 0
 
         # Windows 11 스타일(sv_ttk) 테마 적용 (sv_ttk 미설치 시 기본 ttk 테마 사용)
         if sv_ttk:
             sv_ttk.set_theme(self.settings_mgr.theme_mode, self.root)
         apply_titlebar_theme(self.root, self.settings_mgr.theme_mode == "dark")
-        # sv_ttk가 테마 변경 시 내부적으로 <<ThemeChanged>> 이벤트(큐에 쌓임)로
-        # 위젯 색상/팔레트를 갱신하는데, 이 처리가 끝나기 전에 아래에서 위젯을 만들면
-        # 메뉴/버튼/라벨 일부가 예전 회색(#d9d9d9 계열)으로 만들어지는 문제가 있어
-        # 위젯 생성 전에 강제로 큐를 한 번 비워준다
+        # sv_ttk는 테마 변경 시 <<ThemeChanged>> 이벤트(큐에 쌓임)로 위젯 색상을 갱신하는데,
+        # 이 처리가 끝나기 전에 위젯을 만들면 일부가 기본 회색(#d9d9d9 계열)으로 만들어지므로
+        # 위젯 생성 전에 큐를 한 번 비움
         self.root.update_idletasks()
 
         # 상태표시줄 생성 (side=BOTTOM으로 먼저 pack해야, 이후 fill=BOTH+expand=True로
@@ -5131,9 +5125,8 @@ class MemoApp:
         self.status_bar = ttk.Label(root, text="", relief=tk.SUNKEN, anchor=tk.W, font=("맑은 고딕", 10))
         self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
 
-        # 메뉴막대 아래 [일반메모]/[달력메모]/[컬렉션] 탭 - 하위의 [월별보기]/[1년전체보기]/[목록보기]
-        # 탭과 똑같아 보이지 않도록, 최상위 탭 전용 스타일(더 큰 볼드체 + 넉넉한 여백)을
-        # 적용해 시각적 위계를 분명히 함.
+        # 메뉴막대 아래 최상위 탭 - 하위의 [월별보기]/[1년전체보기]/[목록보기] 탭과 구분되도록
+        # 최상위 탭 전용 스타일(더 큰 볼드체 + 넉넉한 여백)을 적용함.
         top_tab_style = ttk.Style()
         top_tab_style.configure("TopLevel.TNotebook.Tab", font=("맑은 고딕", 13, "bold"),
                                 padding=(24, 4))
@@ -5212,13 +5205,12 @@ class MemoApp:
         # UI 생성 완료 후 창 위치/크기 복원
         self.restore_window_geometry()
 
-        # ⚠️ 시작 시 테마 미적용 문제 보완:
-        # 위젯이 아직 없거나 창이 화면에 표시되기 전에 테마를 적용하면
-        # 메뉴/버튼/라벨/타이틀바 일부가 테마를 제대로 못 받는 경우가 있음
-        # (설정창에서 같은 테마를 다시 '저장'하면 정상으로 보이는 것과 동일한 현상).
-        # 창이 완전히 그려진 뒤 테마를 한 번 더 적용해 이를 자동으로 바로잡는다.
+        # 시작 시 테마 미적용 보정: 위젯이 아직 없거나 창이 화면에 표시되기 전에 테마를 적용하면
+        # 메뉴/버튼/라벨/타이틀바 일부가 테마를 제대로 못 받는 경우가 있어, 창이 완전히 그려진
+        # 뒤 테마를 한 번 더 적용함
         self.root.after(150, self._reapply_theme_on_startup)
         self.root.after(400, self._notify_holiday_problems)
+        self.root.after(700, self._notify_load_problems)
 
     # ---- 저장/자동저장 (MemoStore를 감싸는 얇은 래퍼: 실패 시 알림 대상 key 관리) ----
 
@@ -5299,8 +5291,8 @@ class MemoApp:
     def create_menu(self):
         menubar = tk.Menu(self.root)
         self.file_menu = tk.Menu(menubar, tearoff=0, postcommand=self._update_file_menu)
-        # 가져오기/내보내기는 "지금 보고 있는 탭"의 데이터에 대해 동작하고, 라벨에 그 탭
-        # 이름이 표시됨 (_update_file_menu 참고). 탭이 늘어도 메뉴 항목 수는 그대로임.
+        # 가져오기/내보내기는 "지금 보고 있는 탭"의 데이터에 대해 동작하고, 라벨에 그 탭 이름이
+        # 표시됨 (_update_file_menu 참고)
         self.file_menu.add_command(label="가져오기...", command=self.import_current_tab)
         self.file_menu.add_command(label="내보내기...", command=self.export_current_tab)
         self.file_menu.add_separator()
@@ -5329,10 +5321,10 @@ class MemoApp:
         self._update_file_menu()
 
     # ---- 파일 메뉴: 가져오기/내보내기(현재 탭 기준) + 전체 백업/복원 ----
-    # 탭이 4개로 늘면서 탭별 메뉴를 따로 두면 항목이 8개가 되므로, 가져오기/내보내기는
-    # 활성 탭의 데이터만 다루도록 하나로 합침. 각 탭은 transfer_* 훅(파일 위 안내 주석
-    # 참고)만 제공하고, 파일 선택/확인창/형식별(JSON·TXT·XLSX) 저장 흐름은 여기서 공통
-    # 처리함. 여러 탭의 데이터를 한 번에 옮길 때는 전체 백업(zip)/백업에서 복원을 씀.
+    # 가져오기/내보내기는 활성 탭의 데이터만 다루므로 메뉴 항목은 탭 수와 상관없이 하나씩임.
+    # 각 탭은 transfer_* 훅(파일 위 "앱 구조 안내" 참고)만 제공하고, 파일 선택/확인창/
+    # 형식별(JSON·TXT·XLSX) 저장 흐름은 여기서 공통 처리함. 여러 탭의 데이터를 한 번에
+    # 옮길 때는 전체 백업(zip)/백업에서 복원을 씀.
 
     _FILE_MENU_IMPORT = 0
     _FILE_MENU_EXPORT = 1
@@ -5441,9 +5433,8 @@ class MemoApp:
                     ws.append(row)
                 wb.save(filepath)
             else:
-                # .json/.txt/.xlsx가 아닌 확장자로 저장을 시도한 경우(예: 저장 대화상자에서
-                # 사용자가 직접 다른 확장자를 입력) - 아무 것도 저장하지 않았는데 아래
-                # "성공" 메시지가 뜨는 것을 막기 위해 명시적으로 오류 처리함
+                # .json/.txt/.xlsx가 아닌 확장자(저장 대화상자에서 직접 입력한 경우)면 아무 것도
+                # 저장하지 않았는데 아래 "성공" 메시지가 뜨지 않도록 명시적으로 오류 처리함
                 raise ValueError(
                     f"지원하지 않는 파일 형식입니다: {file_ext or '(확장자 없음)'}\n"
                     ".json / .txt / .xlsx 중 하나로 저장해주세요."
@@ -5640,8 +5631,7 @@ class MemoApp:
         (Alt+T 날짜/시간 삽입, Alt+숫자 빠른 입력에서 공용으로 사용)
         각 탭에게 순서대로 "이 위젯이 네 삽입 대상이니?"라고 물어보고(insert_text_at_widget),
         맞다고 답한 첫 번째 탭에서 멈춘다. 아무 탭도 그 위젯을 모르면(예: 포커스가
-        버튼이나 리스트에 있는 경우) 조용히 아무 일도 하지 않는다 - 예전에는 세 위젯 중
-        하나에도 포커스가 없으면 엉뚱하게 마지막 메모 끝에 삽입되던 버그가 있었음."""
+        버튼이나 리스트에 있는 경우) 조용히 아무 일도 하지 않는다."""
         focused = self.root.focus_get()
         if focused is None:
             return
@@ -5701,9 +5691,8 @@ class MemoApp:
 
     # ---- 탭을 넘나드는 단축키 라우터 ----
     # 아래 라우터들은 전부 같은 형태다: "활성 탭에 이 이름의 메서드가 있으면 호출하고,
-    # 없으면 아무 일도 하지 않는다." 그래서 탭이 늘어나거나(예: 컬렉션 탭 추가) 줄어들어도
-    # 이 메서드들 자체는 손댈 필요가 없고, 각 탭 클래스에 그 이름의 메서드를 만들거나
-    # 지우기만 하면 된다.
+    # 없으면 아무 일도 하지 않는다." 그래서 탭이 늘거나 줄어도 이 메서드들은 손댈 필요 없이,
+    # 각 탭 클래스에 그 이름의 메서드를 만들거나 지우기만 하면 된다.
 
     def _cycle_top_tab(self, direction):
         """Ctrl+Tab(+1)/Ctrl+Shift+Tab(-1): 탭 전환.
@@ -5715,15 +5704,15 @@ class MemoApp:
         return "break"
 
     def _on_ctrl_m_key(self, event=None):
-        """Ctrl+M: 현재 탭에 맞는 "내용" 위젯(또는 목록)에 포커스만 이동함
-        (일반메모: content_text / 달력메모: date_content_text / 컬렉션: 항목 목록)"""
+        """Ctrl+M: 현재 탭의 "내용" 위젯(또는 항목 목록)에 포커스만 이동함
+        (일반메모: content_text / 달력메모: date_content_text / 체크리스트·컬렉션: 항목 목록)"""
         self._dispatch_to_active_tab("focus_content", event)
         return "break"
 
     def _on_ctrl_n_key(self, event=None):
         """Ctrl+N: 탭마다 "새 항목"의 의미가 다름
-        (일반메모: 새 메모 / 컬렉션: 제목·URL·메모 입력창이 있는 새 항목 편집 창 /
-        달력메모: 정의되어 있지 않아 아무 일도 하지 않음)"""
+        (일반메모: 새 메모 / 달력메모: [추가] 팝업 / 체크리스트: 입력창의 내용을 항목으로
+        추가 / 컬렉션: 제목·URL·메모를 한 번에 입력하는 새 항목 편집 창)"""
         method = getattr(self._active_tab(), "on_ctrl_n", None)
         if method:
             return method(event)
@@ -5731,14 +5720,14 @@ class MemoApp:
 
     def _on_ctrl_d_key(self, event=None):
         """Ctrl+D: 탭마다 "선택된 것 삭제"의 의미가 다름
-        (일반메모: 제목/내용에 포커스가 있을 때 메모 삭제 / 달력메모: 선택된
-        날짜의 메모 내용 삭제 / 컬렉션: 선택된 항목 삭제). 메모 목록 자체에
-        포커스가 있을 때는 이미 Delete 키가 그 역할을 하고 있으므로 관여하지 않음"""
+        (일반메모: 제목/내용에 포커스가 있을 때 메모 삭제 / 달력메모: 선택된 날짜의 메모 내용
+        삭제 / 체크리스트·컬렉션: 선택된 항목 삭제). 목록 자체에 포커스가 있을 때는 이미
+        Delete 키가 그 역할을 하고 있으므로 관여하지 않음"""
         return self._dispatch_to_active_tab("on_ctrl_d", event)
 
     def _on_prior_key(self, event=None):
         """전역 PageUp: 탭마다 의미가 다름 (달력메모는 항상 이전 메모 날짜로 이동,
-        일반메모는 목록에 포커스가 있을 때만 순서 이동, 컬렉션은 항목 목록 자체의
+        일반메모는 목록에 포커스가 있을 때만 순서 이동, 체크리스트/컬렉션은 목록 자체의
         바인딩이 처리하므로 여기서는 아무 일도 하지 않음)"""
         return self._dispatch_to_active_tab("on_page_up", event)
 
@@ -5817,6 +5806,17 @@ class MemoApp:
         message += "\n\n날짜는 \"2026-09-25\"처럼 YYYY-MM-DD 형식으로, 이름은 문자열로 적어주세요."
         messagebox.showwarning("공휴일 파일 확인", message, parent=self.root)
 
+    def _notify_load_problems(self):
+        """시작할 때 데이터 파일(memos.json 등)을 정상으로 읽지 못했거나 일부를 건너뛰었다면 한 번
+        안내함. 손상된 원본은 지우지 않고 같은 폴더에 보관해 두므로 거기서 복구할 수 있음."""
+        problems = self.store.load_problems
+        if not problems:
+            return
+        messagebox.showwarning(
+            "데이터 파일 확인",
+            "시작할 때 문제가 있었던 데이터 파일이 있습니다.\n\n" + "\n\n".join(problems),
+            parent=self.root)
+
     def _reapply_theme_on_startup(self):
         """창이 완전히 표시된 뒤 테마를 다시 한번 적용해, 시작 시 일부 위젯이
         테마를 제대로 반영하지 못하는 렌더링 문제를 보정한다."""
@@ -5830,12 +5830,10 @@ class MemoApp:
         geometry = self.settings_mgr.settings.get("window_geometry", "800x600+100+100")
 
         try:
-            # geometry 문자열 검증: "800x600+100+100" 형식.
-            # 좌표는 +100처럼 양수뿐 아니라 -50처럼 음수(창이 화면 왼쪽/위쪽 바깥에
-            # 걸쳐 있던 경우)일 수도 있어, 단순히 '+' 문자 존재 여부만 보면 x/y가
-            # 둘 다 음수인 "800x600-50-30" 같은 유효한 형식을 잘못된 것으로 오판해
-            # 위치가 조용히 기본값으로 리셋되는 문제가 있었음. 정규식으로 폭x높이,
-            # 그리고 +/- 부호가 붙은 x,y 좌표까지 정확히 매치하는지 확인함.
+            # geometry 문자열 검증: "800x600+100+100" 형식. 좌표는 -50처럼 음수(창이 화면
+            # 왼쪽/위쪽 바깥에 걸쳐 있던 경우)일 수도 있어, '+' 문자 유무만 보면 "800x600-50-30"
+            # 같은 유효한 값을 잘못된 것으로 판단함. 정규식으로 폭x높이와 +/- 부호가 붙은
+            # x,y 좌표까지 정확히 확인함.
             if geometry and re.fullmatch(r"\d+x\d+[+-]\d+[+-]\d+", geometry):
                 # UI 레이아웃 완료 대기
                 self.root.update_idletasks()
