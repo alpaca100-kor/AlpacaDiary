@@ -21,6 +21,8 @@ import configparser
 import bisect
 import shutil
 import zipfile
+import codecs
+import hashlib
 from urllib.parse import urlparse
 from datetime import datetime, date, timedelta
 import calendar
@@ -28,8 +30,10 @@ import calendar
 # 엑셀 파일 처리를 위한 라이브러리. (없으면 엑셀 내보내기 비활성화)
 try:
     import openpyxl
+    from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 except ImportError:
     openpyxl = None
+    ILLEGAL_CHARACTERS_RE = None
 
 # Windows 11 스타일(Sun Valley) ttk 테마. (없으면 기본 ttk 테마로 동작)
 try:
@@ -67,6 +71,35 @@ def get_app_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 
+_single_instance_handle = None  # 프로세스가 끝날 때까지 뮤텍스 핸들을 붙잡아 둠 (OS가 종료 시 자동 해제)
+
+
+def acquire_single_instance(app_dir):
+    """같은 폴더(app_dir)의 알파카 다이어리가 이미 실행 중이면 False, 아니면 True를 반환함.
+    둘이 동시에 떠 있으면 서로의 변경을 모른 채 나중에 닫는 쪽이 파일을 덮어쓰기 때문에 막음.
+
+    Windows의 이름 있는 뮤텍스를 쓰며, 이름에 폴더 경로의 해시를 넣어서 다른 폴더에 둔 사본은
+    따로 실행할 수 있음. 비Windows이거나 확인 자체가 실패하면 실행을 막지 않고 True를 반환함."""
+    global _single_instance_handle
+    if sys.platform != "win32":
+        return True
+    try:
+        import ctypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        key = hashlib.sha1(os.path.normcase(os.path.abspath(app_dir)).encode("utf-8")).hexdigest()[:16]
+        handle = kernel32.CreateMutexW(None, False, f"Local\\AlpacaDiary_{key}")
+        if not handle:
+            return True
+        if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS: 다른 프로세스가 이미 만들어 둠
+            return False
+        _single_instance_handle = handle
+        return True
+    except Exception:
+        return True
+
+
 def set_windows_app_id(app_id="alpaca.diary"):
     """Windows 작업표시줄이 이 프로그램을 python/pythonw 등 다른 프로그램과 묶지 않고
     독립된 앱으로 인식하도록 AppUserModelID를 지정함. 창 아이콘이 작업표시줄에도 제대로
@@ -88,12 +121,91 @@ def normalize_url(raw):
     return raw
 
 
+# Excel 셀 하나에 넣을 수 있는 최대 글자 수
+XLSX_MAX_CELL_CHARS = 32767
+
+
+def append_xlsx_row(ws, row):
+    """워크시트에 한 행을 추가함. 메모 내용이 Excel에서 그대로 보이도록 다음을 처리하고,
+    글자 수 제한 때문에 잘린 셀의 개수를 반환함.
+    - '='로 시작하는 문자열(예: "==== 메모 ====")은 openpyxl이 수식으로 저장해 Excel에서 오류가
+      나므로 문자열 셀로 고정함
+    - Excel이 허용하지 않는 제어문자(세로탭 등)는 openpyxl이 예외를 내므로 제거함
+    - 한 셀 최대 글자 수(XLSX_MAX_CELL_CHARS)를 넘으면 잘라냄"""
+    truncated = 0
+    values = []
+    for value in row:
+        if isinstance(value, str):
+            value = ILLEGAL_CHARACTERS_RE.sub("", value)
+            if len(value) > XLSX_MAX_CELL_CHARS:
+                value = value[:XLSX_MAX_CELL_CHARS]
+                truncated += 1
+        values.append(value)
+    ws.append(values)
+    for cell in ws[ws.max_row]:
+        if isinstance(cell.value, str):
+            cell.data_type = "s"
+    return truncated
+
+
 def now_iso():
     return datetime.now().isoformat(timespec="seconds")
 
 
 def short_id():
     return str(uuid.uuid4())
+
+
+def set_text_content(widget, text=""):
+    """코드로 Text 위젯의 내용을 통째로 바꾸고 실행취소 기록을 비움.
+    Tk는 누가 바꿨는지 구분하지 않고 코드의 delete/insert도 기록하므로, 메모를 전환할 때 비우지
+    않으면 Ctrl+Z가 다른 메모의 내용(또는 빈 내용)을 되살리고, 키 입력 자동저장이 그것을 현재
+    메모에 저장해 버림. 그래서 내용을 코드로 채울 때는 항상 이 함수를 써야 함."""
+    widget.delete("1.0", tk.END)
+    widget.insert("1.0", text)
+    widget.edit_reset()
+
+
+def bind_redo_shortcuts(widget):
+    """다시 실행(Redo)을 Ctrl+Y와 Ctrl+Shift+Z로 통일함. Tk의 기본 단축키는 플랫폼마다 달라서
+    (X11은 Ctrl+Shift+Z, Windows는 Ctrl+Y) 직접 연결하며, "break"로 기본 바인딩이 한 번 더
+    실행되어 두 단계가 다시 실행되는 일을 막음. (취소는 모든 플랫폼에서 기본 Ctrl+Z)"""
+    def redo(event):
+        try:
+            widget.edit_redo()
+        except tk.TclError:
+            pass  # 다시 실행할 기록이 없음
+        return "break"
+    for sequence in ("<Control-y>", "<Control-Y>", "<Control-Z>"):
+        widget.bind(sequence, redo)
+
+
+def insert_text_as_one_undo_step(widget, text):
+    """선택 영역이 있으면 지우고 text를 커서 위치에 넣되, (삭제+삽입) 전체가 Ctrl+Z 한 번에 취소되고
+    앞뒤 타이핑과도 섞이지 않도록 하나의 실행취소 묶음으로 기록함. (autoseparators는 삭제↔삽입이
+    바뀔 때 묶음을 나누므로, 이 작업 동안만 꺼 둠)"""
+    widget.edit_separator()
+    widget.configure(autoseparators=False)
+    try:
+        try:
+            widget.delete("sel.first", "sel.last")
+        except tk.TclError:
+            pass  # 선택 영역이 없음
+        widget.insert(tk.INSERT, text)
+    finally:
+        widget.configure(autoseparators=True)
+    widget.edit_separator()
+
+
+def unique_id(raw, seen):
+    """파일에서 읽은 id를 문자열로 바꿔 반환하되, 비어 있거나 seen에 이미 있으면(직접 편집한
+    파일 등에서 중복) 새 id를 만듦. Treeview는 같은 id의 행을 두 번 넣으면 TclError가 남.
+    반환한 id는 seen에 기록함."""
+    value = str(raw or "")
+    if not value or value in seen:
+        value = short_id()
+    seen.add(value)
+    return value
 
 
 # MemoStore._read_json이 "읽을 데이터가 없음(파일 없음/빈 파일/손상)"을 알리는 표지.
@@ -268,6 +380,16 @@ QUICK_INPUT_KEYS = [str(i) for i in range(1, 10)] + ["0"]
 # 추가/삭제/편집 확정 같은 불연속 동작으로만 바뀌므로 디바운스 없이 즉시 저장함)
 AUTOSAVE_DEBOUNCE_MS = 500
 
+# 되돌릴 수 없는 작업(가져오기/복원/달력메모 일괄삭제) 직전에 만드는 자동 백업:
+# 앱 폴더 아래 AUTO_BACKUP_DIRNAME 폴더에 ZIP으로 남기고, 최근 AUTO_BACKUP_KEEP개만 보관함
+AUTO_BACKUP_DIRNAME = "backup_auto"
+AUTO_BACKUP_PREFIX = "AlpacaDiary_auto_"
+AUTO_BACKUP_KEEP = 10
+
+# 본문 Text 위젯의 실행취소(Ctrl+Z, 다시실행 Ctrl+Y) 설정. Tk가 입력/삭제를 묶음 단위로 기록하며
+# (autoseparators: 입력↔삭제가 바뀔 때마다 묶음을 나눔), 기록이 메모리를 무한정 쓰지 않도록 상한을 둠
+TEXT_UNDO_OPTIONS = {"undo": True, "autoseparators": True, "maxundo": 1000}
+
 # 백업 ZIP 안의 파일 하나당 읽을 수 있는 최대 크기(바이트). 손상되었거나 악의적으로 만든
 # ZIP이 메모리를 과도하게 쓰지 않도록 막는 안전장치 (일반적인 메모 데이터는 이보다 훨씬 작음)
 MAX_BACKUP_MEMBER_BYTES = 100 * 1024 * 1024
@@ -431,6 +553,10 @@ def apply_titlebar_theme(root, dark):
 # ============================================================================
 
 
+class WriteBlockedError(OSError):
+    """시작할 때 읽지 못한 파일을 덮어쓰지 않으려고 저장을 막았을 때 발생 (MemoStore.write_blocked)"""
+
+
 class MemoStore:
     """memos.json / memos_calendar.json / collections.json / checklists.json /
     settings.ini / quick_inputs.json / holidays.json 파일 입출력만 담당. tkinter
@@ -439,6 +565,7 @@ class MemoStore:
     읽는 중 생긴 안내 문구만 load_problems/holiday_problems에 모아 둠."""
 
     def __init__(self, app_dir):
+        self.app_dir = app_dir
         self.file_path = os.path.join(app_dir, "memos.json")
         self.settings_file = os.path.join(app_dir, "settings.ini")
         self.quick_input_file = os.path.join(app_dir, "quick_inputs.json")
@@ -448,18 +575,30 @@ class MemoStore:
         self.checklists_file = os.path.join(app_dir, "checklists.json")
         # 시작할 때 읽지 못했거나 일부를 건너뛴 데이터 파일 안내 문구 (시작 후 MemoApp이 한 번 보여줌)
         self.load_problems = []
+        # 열지 못해서(사용 중/권한) 빈 데이터로 시작한 파일의 경로. 종료할 때의 자동 저장이 읽지 못한
+        # 원본을 빈 데이터로 덮어쓰지 않도록, 이 경로에는 쓰지 않음 (_atomic_write 참고)
+        self.write_blocked = set()
+        # 가장 최근 _atomic_write의 실패 원인(성공하면 None). 저장 실패 팝업에 사유를 보여주는 데 씀
+        self.last_write_error = None
 
     def _atomic_write(self, path, write_func):
         """write_func(파일객체)로 내용을 쓰되, 같은 폴더의 임시 파일에 먼저 쓴 뒤 os.replace()로
         교체하는 원자적 저장. os.replace()는 이름만 바꾸는 연산이라 OS가 원자적으로 처리하므로,
         쓰는 도중 앱이 강제 종료되거나 오류가 나도 원본 파일(path)은 손상되지 않음.
         (원자성을 보장하려면 임시 파일이 같은 폴더에 있어야 함)"""
+        if path in self.write_blocked:
+            self.last_write_error = WriteBlockedError(
+                f"{os.path.basename(path)} 파일을 읽지 못한 채 시작해서 덮어쓰지 않습니다. "
+                "프로그램을 다시 실행해 주세요.")
+            raise self.last_write_error
         tmp_path = path + ".tmp"
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
                 write_func(f)
             os.replace(tmp_path, path)
-        except Exception:
+            self.last_write_error = None
+        except Exception as e:
+            self.last_write_error = e
             # 어떤 예외든 원본은 아직 손대지 않았으므로 안전함. 남은 임시 파일만 정리하고
             # 예외는 그대로 위로 전달함
             try:
@@ -494,6 +633,35 @@ class MemoStore:
             except OSError:
                 pass
             raise
+
+    def write_auto_backup(self, files, reason, keep=AUTO_BACKUP_KEEP):
+        """되돌릴 수 없는 작업 직전의 데이터를 앱 폴더의 AUTO_BACKUP_DIRNAME 폴더에 ZIP으로 남기고,
+        오래된 자동 백업은 최근 keep개만 남기고 지움. 만든 파일의 경로를 반환함.
+        실패하면 예외를 그대로 전달함 (호출한 쪽이 계속할지 사용자에게 물음)."""
+        folder = os.path.join(self.app_dir, AUTO_BACKUP_DIRNAME)
+        os.makedirs(folder, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(folder, f"{AUTO_BACKUP_PREFIX}{reason}_{stamp}.zip")
+        number = 2
+        while os.path.exists(path):  # 같은 초에 두 번 만들어도 기존 백업을 덮어쓰지 않음
+            path = os.path.join(folder, f"{AUTO_BACKUP_PREFIX}{reason}_{stamp}_{number}.zip")
+            number += 1
+        self.write_backup_zip(path, files)
+        self._prune_auto_backups(folder, keep)
+        return path
+
+    @staticmethod
+    def _prune_auto_backups(folder, keep):
+        """folder 안의 자동 백업(AUTO_BACKUP_PREFIX로 시작하는 .zip)만 최근 keep개 남기고 지움.
+        정리에 실패해도 백업 자체는 이미 만들어졌으므로 무시함."""
+        try:
+            names = [n for n in os.listdir(folder)
+                     if n.startswith(AUTO_BACKUP_PREFIX) and n.endswith(".zip")]
+            names.sort(key=lambda n: (os.path.getmtime(os.path.join(folder, n)), n), reverse=True)
+            for old in names[keep:]:
+                os.remove(os.path.join(folder, old))
+        except OSError:
+            pass
 
     def read_backup_zip(self, path, names):
         """백업 ZIP에서 names(파일명 집합)에 해당하는 파일을 읽어 {파일명: 텍스트}로 반환.
@@ -540,7 +708,9 @@ class MemoStore:
         - 손상(JSON/UTF-8 아님)이거나 check(data)가 False(예상한 구조가 아님)면 NO_DATA를 반환하고,
           quarantine=True면 원본을 보관한 뒤 load_problems에 안내를 남김. 앱이 쓰지 않는 참고용
           파일(holidays.json)은 quarantine=False로 불러 원본을 그대로 둠.
-        - 파일을 열지 못하는 경우(권한/사용 중)는 원본을 건드리지 않고 안내만 남김."""
+        - 파일을 열지 못하는 경우(권한/사용 중)는 원본을 건드리지 않고 안내를 남기며, 빈 데이터로 시작한
+          뒤 원본을 덮어쓰지 않도록 그 경로의 저장을 막음(write_blocked). 참고용 파일(quarantine=False)은
+          어차피 쓰지 않으므로 안내만 남김."""
         if not os.path.exists(path):
             return NO_DATA
         name = os.path.basename(path)
@@ -559,7 +729,12 @@ class MemoStore:
                 return NO_DATA
             data = json.loads(text)
         except OSError as e:
-            self.load_problems.append(f"{name}: 파일을 읽지 못했습니다 ({e.__class__.__name__}).")
+            message = f"{name}: 파일을 읽지 못했습니다 ({e.__class__.__name__})."
+            if quarantine:
+                self.write_blocked.add(path)
+                message += ("\n  → 원본이 빈 데이터로 덮어써지지 않도록 이 파일은 저장하지 않습니다."
+                            "\n    다른 프로그램이 파일을 사용 중인지 확인한 뒤 프로그램을 다시 실행해 주세요.")
+            self.load_problems.append(message)
             return NO_DATA
         except (UnicodeDecodeError, json.JSONDecodeError):
             return reject("올바른 JSON(UTF-8) 파일이 아니라서 읽지 못했습니다.")
@@ -723,6 +898,8 @@ class MemoStore:
             lambda d: isinstance(d, dict) and isinstance(d.get("collections"), list))
         if data is NO_DATA:
             return {"collections": []}
+        # 항목/폴더 id가 겹치면 새로 만듦 (직접 편집한 파일 대비)
+        seen_parents, seen_items = set(), set()
         cleaned = []
         for col in data["collections"]:
             if not isinstance(col, dict):
@@ -733,14 +910,14 @@ class MemoStore:
                 if not isinstance(it, dict):
                     continue
                 items.append({
-                    "id": str(it.get("id") or short_id()),
+                    "id": unique_id(it.get("id"), seen_items),
                     "title": str(it.get("title", "")),
                     "url": str(it.get("url", "")),
                     "memo": str(it.get("memo", "")),
                     "added": str(it.get("added", "")),
                 })
             cleaned.append({
-                "id": str(col.get("id") or short_id()),
+                "id": unique_id(col.get("id"), seen_parents),
                 "name": str(col.get("name", "이름 없음")),
                 "created": str(col.get("created", "")),
                 "items": items,
@@ -765,6 +942,8 @@ class MemoStore:
             lambda d: isinstance(d, dict) and isinstance(d.get("folders"), list))
         if data is NO_DATA:
             return {"folders": []}
+        # 항목/폴더 id가 겹치면 새로 만듦 (직접 편집한 파일 대비)
+        seen_parents, seen_items = set(), set()
         cleaned = []
         for folder in data["folders"]:
             if not isinstance(folder, dict):
@@ -775,13 +954,13 @@ class MemoStore:
                 if not isinstance(it, dict):
                     continue
                 items.append({
-                    "id": str(it.get("id") or short_id()),
+                    "id": unique_id(it.get("id"), seen_items),
                     "content": str(it.get("content", "")),
                     "checked": bool(it.get("checked", False)),
                     "added": str(it.get("added", "")),
                 })
             cleaned.append({
-                "id": str(folder.get("id") or short_id()),
+                "id": unique_id(folder.get("id"), seen_parents),
                 "name": str(folder.get("name", "이름 없음")),
                 "created": str(folder.get("created", "")),
                 "items": items,
@@ -1096,7 +1275,9 @@ class GeneralMemoTab:
         content_label.pack(anchor="w")
         # height=1: 지정하지 않으면 Text 기본 높이(24줄)가 자연 요구 크기가 되어, 창이 작을 때
         # 아래 [복사] 버튼 등 형제 위젯이 창 밖으로 밀려남. 실제 크기는 fill=BOTH+expand가 결정함
-        self.content_text = tk.Text(right_panel, font=app.settings_mgr.content_font, padx=10, pady=8, height=1)
+        self.content_text = tk.Text(right_panel, font=app.settings_mgr.content_font, padx=10, pady=8, height=1,
+                                    **TEXT_UNDO_OPTIONS)
+        bind_redo_shortcuts(self.content_text)
         self.content_text.pack(fill=tk.BOTH, expand=True)
         self.content_text.bind("<KeyRelease>", lambda event: self.update_memo_realtime(event, update_list=False))
         self.content_text.bind("<ButtonRelease-1>", self.app.update_status_bar)
@@ -1229,11 +1410,7 @@ class GeneralMemoTab:
             self.update_memo_realtime(update_list=True)
             return True
         if widget is self.content_text:
-            try:
-                self.content_text.delete("sel.first", "sel.last")
-            except tk.TclError:
-                pass
-            self.content_text.insert(tk.INSERT, text)
+            insert_text_as_one_undo_step(self.content_text, text)
             self.update_memo_realtime(update_list=False)
             return True
         return False
@@ -1278,8 +1455,7 @@ class GeneralMemoTab:
         self.toggle_right_panel(True)
         self.title_entry.delete(0, tk.END)
         self.title_entry.insert(0, memo["title"])
-        self.content_text.delete("1.0", tk.END)
-        self.content_text.insert("1.0", memo["content"])
+        set_text_content(self.content_text, memo["content"])
         self.app.update_status_bar()
 
     def add_memo(self):
@@ -1304,7 +1480,7 @@ class GeneralMemoTab:
             del self.memos[removed_index]
             self.current_index = -1
             self.title_entry.delete(0, tk.END)
-            self.content_text.delete("1.0", tk.END)
+            set_text_content(self.content_text)
             self.toggle_right_panel(False)
             # 화면 위쪽(보이는 영역보다 앞)의 행을 지웠다면 아래 행들이 한 칸씩 올라오므로
             # 보던 첫 행이 그대로 맨 위에 오도록 한 칸 보정함
@@ -1482,7 +1658,7 @@ class GeneralMemoTab:
         ok = self.app.save_memos()
         self.current_index = -1
         self.title_entry.delete(0, tk.END)
-        self.content_text.delete("1.0", tk.END)
+        set_text_content(self.content_text)
         self.toggle_right_panel(False)
         self.update_listbox()
         return ok
@@ -1727,9 +1903,11 @@ class CalendarMemoTab:
         ttk.Label(cal_right, textvariable=self.date_label_var, font=UI_FONT).pack(anchor="w")
 
         # height=1: content_text와 같은 이유(자연 요구 크기 최소화)
-        self.date_content_text = tk.Text(cal_right, font=app.settings_mgr.content_font, padx=10, pady=8, height=1)
+        self.date_content_text = tk.Text(cal_right, font=app.settings_mgr.content_font, padx=10, pady=8,
+                                         height=1, **TEXT_UNDO_OPTIONS)
         self.date_content_text.pack(fill=tk.BOTH, expand=True)
-        self.date_content_text.insert("1.0", self.calendar_memos.get(self.selected_date, ""))
+        bind_redo_shortcuts(self.date_content_text)
+        set_text_content(self.date_content_text, self.calendar_memos.get(self.selected_date, ""))
         self.date_content_text.bind("<KeyRelease>", self.save_date_memo_realtime)
         self.date_content_text.bind("<ButtonRelease-1>", self.app.update_status_bar)
         # PageUp/PageDown은 내용을 편집 중이어도 항상 이전/다음 메모로 이동해야 하므로,
@@ -1870,11 +2048,7 @@ class CalendarMemoTab:
 
     def insert_text_at_widget(self, widget, text):
         if widget is self.date_content_text:
-            try:
-                self.date_content_text.delete("sel.first", "sel.last")
-            except tk.TclError:
-                pass
-            self.date_content_text.insert(tk.INSERT, text)
+            insert_text_as_one_undo_step(self.date_content_text, text)
             self.save_date_memo_realtime()
             return True
         return False
@@ -1990,8 +2164,7 @@ class CalendarMemoTab:
 
         self.selected_date = date_key
         self.date_label_var.set(self._format_date_label(date_key))
-        self.date_content_text.delete("1.0", tk.END)
-        self.date_content_text.insert("1.0", self.calendar_memos.get(date_key, ""))
+        set_text_content(self.date_content_text, self.calendar_memos.get(date_key, ""))
         self._update_remove_date_memo_button_state()
         self._refresh_calendar_views(redraw_list=redraw_list)
         self.app.update_status_bar()
@@ -2503,7 +2676,8 @@ class CalendarMemoTab:
         desc = (
             "선택한 날짜를 포함하여 그 이전 날짜에 저장된 달력메모 내용을\n"
             "모두 삭제합니다.\n\n"
-            "※ 삭제 후에는 되돌릴 수 없으니 날짜를 확인한 뒤 실행하세요."
+            f"※ 삭제 직전에 현재 데이터가 {AUTO_BACKUP_DIRNAME} 폴더에 자동 백업됩니다.\n"
+            "   그래도 날짜를 확인한 뒤 실행하세요."
         )
         ttk.Label(dialog, text=desc, font=("맑은 고딕", 9), foreground=colors["sunday_fg"],
                   justify=tk.LEFT).grid(row=1, column=0, columnspan=2, padx=10, pady=10, sticky="w")
@@ -2516,6 +2690,11 @@ class CalendarMemoTab:
                 messagebox.showerror("오류", "날짜를 YYYY-MM-DD 형식으로 입력하세요.", parent=dialog)
                 return
             to_delete = [d for d in self.calendar_memos if d <= cutoff]
+            backup_path = None
+            if to_delete:
+                proceed, backup_path = self.app.auto_backup_before("before-bulk-delete", parent=dialog)
+                if not proceed:
+                    return
             for d in to_delete:
                 del self.calendar_memos[d]
             self.app.save_calendar_memos()
@@ -2523,7 +2702,8 @@ class CalendarMemoTab:
             self.on_calendar_date_click(self.selected_date)
             dialog.destroy()
             if to_delete:
-                messagebox.showinfo("완료", f"{len(to_delete)}개의 달력메모를 삭제했습니다.")
+                messagebox.showinfo(
+                    "완료", f"{len(to_delete)}개의 달력메모를 삭제했습니다." + self.app.backup_note(backup_path))
             else:
                 messagebox.showinfo("완료", "삭제할 메모가 없습니다.")
 
@@ -2559,8 +2739,7 @@ class CalendarMemoTab:
     def transfer_apply(self, data):
         self.calendar_memos = data
         ok = self.app.save_calendar_memos()
-        self.date_content_text.delete("1.0", tk.END)
-        self.date_content_text.insert("1.0", self.calendar_memos.get(self.selected_date, ""))
+        set_text_content(self.date_content_text, self.calendar_memos.get(self.selected_date, ""))
         self._update_remove_date_memo_button_state()
         self.render_month_view()
         self.render_year_view()
@@ -2608,6 +2787,11 @@ class TitleFetcher:
     CHARSET_META_RE = re.compile(rb'charset=["\']?\s*([\w\-]+)', re.IGNORECASE)
 
     REQUEST_TIMEOUT = 8
+    # timeout은 "한 번의 읽기를 기다리는 시간"이라 큰 파일이나 조금씩 계속 오는 응답은 못 막으므로,
+    # 본문은 앞쪽 MAX_HTML_BYTES까지만 읽고(제목은 문서 앞부분에 있음), 요청 하나가 끝나기까지의
+    # 전체 시간은 MAX_TOTAL_SECONDS로 제한함 (fetch_async 참고)
+    MAX_HTML_BYTES = 512 * 1024
+    MAX_TOTAL_SECONDS = 20
     USER_AGENT = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -2616,7 +2800,8 @@ class TitleFetcher:
         "User-Agent": USER_AGENT,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
         "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Accept-Encoding": "gzip, deflate, br",
+        # br(Brotli)은 brotli 패키지가 없으면 requests가 풀지 못해 본문이 깨지므로 알리지 않음
+        "Accept-Encoding": "gzip, deflate",
         "Upgrade-Insecure-Requests": "1",
     }
 
@@ -2624,8 +2809,24 @@ class TitleFetcher:
         self.result_queue = result_queue
 
     def fetch_async(self, url, request_id):
-        thread = threading.Thread(target=self._fetch, args=(url, request_id), daemon=True)
+        thread = threading.Thread(target=self._fetch_with_deadline, args=(url, request_id), daemon=True)
         thread.start()
+
+    def _fetch_with_deadline(self, url, request_id):
+        """_fetch를 작업 스레드에서 돌리고, MAX_TOTAL_SECONDS 안에 끝나지 않으면 시간 초과로 알림.
+        (요청 라이브러리에는 전체 시간 제한이 없고, 응답이 조금씩 계속 오면 읽기가 끝나지 않아
+        '가져오는 중' 상태로 남기 때문) 작업 스레드는 요청마다 따로 만든 큐에 결과를 넣으므로,
+        시간 초과로 포기한 작업이 나중에 끝나도 그 결과가 앱에 전달되지는 않음."""
+        private_queue = queue.Queue()
+        worker = threading.Thread(
+            target=type(self)(private_queue)._fetch, args=(url, request_id), daemon=True)
+        worker.start()
+        worker.join(self.MAX_TOTAL_SECONDS)
+        try:
+            result = private_queue.get_nowait()
+        except queue.Empty:
+            result = {"request_id": request_id, "title": None, "error": "요청 시간이 초과되었습니다."}
+        self.result_queue.put(result)
 
     def _put(self, request_id, title=None, error=None):
         self.result_queue.put({"request_id": request_id, "title": title, "error": error})
@@ -2635,12 +2836,19 @@ class TitleFetcher:
             self._put(request_id, error="requests 라이브러리가 설치되어 있지 않습니다.")
             return
         try:
-            resp = requests.get(
+            with requests.get(
                 url, headers=self.REQUEST_HEADERS, timeout=self.REQUEST_TIMEOUT, allow_redirects=True,
-            )
-            resp.raise_for_status()
-            resp.encoding = self._resolve_encoding(resp)
-            html_text = resp.text
+                stream=True,
+            ) as resp:
+                resp.raise_for_status()
+                content_type = resp.headers.get("Content-Type", "")
+                mime = content_type.split(";")[0].strip().lower()
+                # PDF/이미지/압축파일 같은 것은 내려받지 않고 바로 알림 (Content-Type이 없으면 시도함)
+                if mime and not (mime.startswith("text/") or "html" in mime or "xml" in mime):
+                    self._put(request_id, error=f"웹 페이지(HTML)가 아니라서 제목을 가져올 수 없습니다 ({mime})")
+                    return
+                raw = self._read_limited(resp)
+            html_text = self._decode(raw, content_type)
 
             head_match = self.HEAD_RE.search(html_text)
             head_html = head_match.group(1) if head_match else None
@@ -2694,15 +2902,41 @@ class TitleFetcher:
                 return attrs["content"]
         return None
 
+    def _read_limited(self, resp):
+        """응답 본문을 앞에서부터 읽되 MAX_HTML_BYTES를 넘으면 거기서 멈추고 읽은 데까지만 반환함
+        (gzip 등은 풀린 크기 기준). 읽는 도중 연결이 끊겨도 이미 받은 부분이 있으면 그것으로
+        제목을 찾아봄."""
+        chunks, size = [], 0
+        try:
+            for chunk in resp.iter_content(chunk_size=32768):
+                if not chunk:
+                    continue
+                chunks.append(chunk)
+                size += len(chunk)
+                if size >= self.MAX_HTML_BYTES:
+                    break
+        except requests.exceptions.RequestException:
+            if not chunks:
+                raise
+        return b"".join(chunks)[:self.MAX_HTML_BYTES]
+
     @classmethod
-    def _resolve_encoding(cls, resp):
+    def _decode(cls, raw, content_type):
+        """바이트를 문자열로 바꿈 (알 수 없는 인코딩 이름이면 UTF-8, 깨진 글자는 대체 문자로)"""
+        encoding = cls._resolve_encoding(content_type, raw)
+        try:
+            return raw.decode(encoding, errors="replace")
+        except (LookupError, TypeError):
+            return raw.decode("utf-8", errors="replace")
+
+    @classmethod
+    def _resolve_encoding(cls, content_type, raw):
         # 1순위: HTTP 응답 헤더의 charset
-        content_type = resp.headers.get("Content-Type", "")
         header_match = cls.CHARSET_HEADER_RE.search(content_type)
         if header_match:
             return header_match.group(1)
         # 2순위: HTML 문서 안의 <meta charset="..."> (한글 사이트에서 euc-kr/cp949가 자주 쓰임)
-        meta_match = cls.CHARSET_META_RE.search(resp.content[:4096])
+        meta_match = cls.CHARSET_META_RE.search(raw[:4096])
         if meta_match:
             try:
                 encoding = meta_match.group(1).decode("ascii", errors="ignore").strip("\"' ")
@@ -2710,8 +2944,24 @@ class TitleFetcher:
                     return encoding
             except Exception:
                 pass
-        # 3순위: requests의 휴리스틱 추정
-        return resp.apparent_encoding or "utf-8"
+        # 3순위: UTF-8로 읽히면 UTF-8 (UTF-8이 아닌 글이 우연히 UTF-8로 읽힐 가능성은 매우 낮음.
+        # 앞부분만 읽어 끝이 글자 중간에서 잘렸을 수 있으므로 잘린 끝은 허용함)
+        try:
+            codecs.getincrementaldecoder("utf-8")().decode(raw, final=False)
+            return "utf-8"
+        except UnicodeDecodeError:
+            pass
+        # 4순위: requests가 쓰는 인코딩 추정기(chardet 등)로 추정 (느릴 수 있어 앞부분만 사용)
+        detect = getattr(getattr(requests.compat, "chardet", None), "detect", None)
+        if detect:
+            try:
+                guess = detect(raw[:65536]).get("encoding")
+                if guess:
+                    return guess
+            except Exception:
+                pass
+        # 추정기가 없거나 실패하면 한글 윈도우 기본 인코딩(cp949)
+        return "cp949"
 
     @staticmethod
     def _clean_title(raw):
@@ -2754,8 +3004,10 @@ class EditItemDialog(tk.Toplevel):
             selectbackground=colors["text_select_bg"], selectforeground=colors["text_select_fg"],
             relief=tk.FLAT, borderwidth=0, highlightthickness=1,
             highlightbackground=colors["border"], highlightcolor=colors["accent"],
+            **TEXT_UNDO_OPTIONS,
         )
-        self.memo_text.insert("1.0", item.get("memo", ""))
+        bind_redo_shortcuts(self.memo_text)
+        set_text_content(self.memo_text, item.get("memo", ""))
         self.memo_text.grid(row=5, column=0, pady=(2, 14))
 
         btn_frame = ttk.Frame(frame)
@@ -3866,6 +4118,8 @@ class ChecklistTab:
         기본값을 채우지만, 타입이 틀린 값은 조용히 보정하지 않고 오류로 알림."""
         if not isinstance(raw, dict) or not isinstance(raw.get("folders"), list):
             raise TypeError('데이터가 {"folders": [...]} 형태가 아닙니다.')
+        # 항목/폴더 id가 겹치면 새로 만듦 (직접 편집한 파일 대비)
+        seen_parents, seen_items = set(), set()
         cleaned = []
         for folder in raw["folders"]:
             if not isinstance(folder, dict):
@@ -3881,13 +4135,13 @@ class ChecklistTab:
                 if not isinstance(checked, bool):
                     raise ValueError("항목의 완료 여부(checked)는 true/false여야 합니다.")
                 items.append({
-                    "id": str(it.get("id") or short_id()),
+                    "id": unique_id(it.get("id"), seen_items),
                     "content": str(it.get("content", "")),
                     "checked": checked,
                     "added": str(it.get("added", "")),
                 })
             cleaned.append({
-                "id": str(folder.get("id") or short_id()),
+                "id": unique_id(folder.get("id"), seen_parents),
                 "name": str(folder.get("name", "이름 없음")),
                 "created": str(folder.get("created", "")),
                 "items": items,
@@ -5020,6 +5274,8 @@ class CollectionTab:
         (잘못되면 TypeError/ValueError). "엣지 컬렉션 매니저"가 만든 파일도 읽을 수 있음."""
         if not isinstance(raw, dict) or not isinstance(raw.get("collections"), list):
             raise TypeError('데이터가 {"collections": [...]} 형태가 아닙니다.')
+        # 항목/폴더 id가 겹치면 새로 만듦 (직접 편집한 파일 대비)
+        seen_parents, seen_items = set(), set()
         cleaned = []
         for col in raw["collections"]:
             if not isinstance(col, dict):
@@ -5032,14 +5288,14 @@ class CollectionTab:
                 if not isinstance(it, dict):
                     raise ValueError("항목이 딕셔너리가 아닙니다.")
                 items.append({
-                    "id": str(it.get("id") or short_id()),
+                    "id": unique_id(it.get("id"), seen_items),
                     "title": str(it.get("title", "")),
                     "url": str(it.get("url", "")),
                     "memo": str(it.get("memo", "")),
                     "added": str(it.get("added", "")),
                 })
             cleaned.append({
-                "id": str(col.get("id") or short_id()),
+                "id": unique_id(col.get("id"), seen_parents),
                 "name": str(col.get("name", "이름 없음")),
                 "created": str(col.get("created", "")),
                 "items": items,
@@ -5214,32 +5470,32 @@ class MemoApp:
 
     # ---- 저장/자동저장 (MemoStore를 감싸는 얇은 래퍼: 실패 시 알림 대상 key 관리) ----
 
-    def save_memos(self):
+    def _after_save(self, key, ok, notify):
+        """저장 결과 처리: 성공하면 '알린 실패' 기록을 지우고, 실패하면(notify일 때) 팝업으로 알림.
+        notify=False는 종료 처리처럼 호출한 쪽이 직접 안내하는 경우에 씀."""
+        if ok:
+            self._save_failed_keys.discard(key)
+        elif notify:
+            self._notify_save_failure(key)
+
+    def save_memos(self, notify=True):
         ok = self.store.save_memos(self.general_tab.memos)
-        if ok:
-            self._save_failed_keys.discard("memos")
+        self._after_save("memos", ok, notify)
         return ok
 
-    def save_calendar_memos(self):
+    def save_calendar_memos(self, notify=True):
         ok = self.store.save_calendar_memos(self.calendar_tab.calendar_memos)
-        if ok:
-            self._save_failed_keys.discard("calendar_memos")
+        self._after_save("calendar_memos", ok, notify)
         return ok
 
-    def save_collections(self):
+    def save_collections(self, notify=True):
         ok = self.store.save_collections(self.collection_tab.data)
-        if ok:
-            self._save_failed_keys.discard("collections")
-        else:
-            self._notify_save_failure("collections")
+        self._after_save("collections", ok, notify)
         return ok
 
-    def save_checklists(self):
+    def save_checklists(self, notify=True):
         ok = self.store.save_checklists(self.checklist_tab.data)
-        if ok:
-            self._save_failed_keys.discard("checklists")
-        else:
-            self._notify_save_failure("checklists")
+        self._after_save("checklists", ok, notify)
         return ok
 
     def _debounced_save(self, key, save_func, delay_ms=AUTOSAVE_DEBOUNCE_MS):
@@ -5271,10 +5527,17 @@ class MemoApp:
         self._save_failed_keys.add(key)
         label = {"memos": "일반메모", "calendar_memos": "달력메모", "collections": "컬렉션",
                   "checklists": "체크리스트"}.get(key, key)
+        error = self.store.last_write_error
+        if isinstance(error, WriteBlockedError):
+            # 시작할 때 읽지 못한 파일: 디스크/권한 문제가 아니라 덮어쓰기 방지 때문이므로 그 사유만 안내
+            detail = f"{error}\n"
+        elif error is not None:
+            detail = f"사유: {error}\n디스크 공간이나 저장 폴더의 쓰기 권한을 확인해주세요.\n"
+        else:
+            detail = "디스크 공간이나 저장 폴더의 쓰기 권한을 확인해주세요.\n"
         messagebox.showerror(
             "저장 실패",
-            f"{label} 자동저장에 실패했습니다.\n"
-            "디스크 공간이나 저장 폴더의 쓰기 권한을 확인해주세요.\n"
+            f"{label} 저장에 실패했습니다.\n{detail}"
             "입력한 내용은 화면에 남아있지만 파일에는 아직 저장되지 않았습니다.",
             parent=self.root,
         )
@@ -5382,17 +5645,25 @@ class MemoApp:
                 text = f.read()
             data = self._parse_transfer_text(tab, text)
             if not messagebox.askyesno(
-                    "확인", f"기존 [{label}] 데이터를 모두 덮어쓰고 가져오시겠습니까?", parent=self.root):
+                    "확인",
+                    f"기존 [{label}] 데이터를 모두 덮어쓰고 가져오시겠습니까?\n\n"
+                    f"(실행 직전에 현재 데이터가 {AUTO_BACKUP_DIRNAME} 폴더에 자동 백업됩니다.)",
+                    parent=self.root):
+                return
+            proceed, backup_path = self.auto_backup_before("before-import")
+            if not proceed:
                 return
             ok = tab.transfer_apply(data)
             self.update_status_bar()
             if ok:
-                messagebox.showinfo("성공", f"[{label}] 데이터를 성공적으로 가져왔습니다.", parent=self.root)
+                messagebox.showinfo(
+                    "성공", f"[{label}] 데이터를 성공적으로 가져왔습니다." + self.backup_note(backup_path),
+                    parent=self.root)
             else:
                 messagebox.showwarning(
                     "저장 실패",
                     f"[{label}] 데이터를 화면에는 반영했지만 파일 저장에 실패했습니다.\n"
-                    "디스크 공간이나 저장 폴더의 쓰기 권한을 확인해주세요.",
+                    "디스크 공간이나 저장 폴더의 쓰기 권한을 확인해주세요." + self.backup_note(backup_path),
                     parent=self.root)
         except Exception as e:
             messagebox.showerror("오류", self._describe_transfer_error(label, e), parent=self.root)
@@ -5414,6 +5685,7 @@ class MemoApp:
         if not filepath:
             return
         file_ext = os.path.splitext(filepath)[1].lower()
+        truncated_cells = 0
         try:
             if file_ext == ".json":
                 self.store.write_json(filepath, tab.transfer_export_json())
@@ -5428,9 +5700,9 @@ class MemoApp:
                 wb = openpyxl.Workbook()
                 ws = wb.active
                 ws.title = sheet_title
-                ws.append(header)
+                append_xlsx_row(ws, header)
                 for row in rows:
-                    ws.append(row)
+                    truncated_cells += append_xlsx_row(ws, row)
                 wb.save(filepath)
             else:
                 # .json/.txt/.xlsx가 아닌 확장자(저장 대화상자에서 직접 입력한 경우)면 아무 것도
@@ -5442,19 +5714,58 @@ class MemoApp:
             message = f"[{label}] 데이터를 {filepath} 파일로 내보냈습니다."
             if file_ext != ".json":
                 message += "\n\nTXT/Excel 파일은 보관·열람용이며, 가져오기는 JSON 파일만 지원합니다."
+            if truncated_cells:
+                message += (f"\n\nExcel 한 셀의 최대 글자 수({XLSX_MAX_CELL_CHARS:,}자)를 넘는 "
+                            f"{truncated_cells}개 셀은 잘려서 저장되었습니다. 전체 내용은 JSON으로 내보내세요.")
             messagebox.showinfo("성공", message, parent=self.root)
         except Exception as e:
             messagebox.showerror("오류", f"파일 내보내기 중 오류 발생: {e}", parent=self.root)
+
+    def _commit_inline_edits(self):
+        """열려 있는 인라인 편집(컬렉션/체크리스트)을 확정해 데이터에 반영함 (백업/종료 직전에 사용)"""
+        for tab in self.tabs:
+            commit = getattr(tab, "on_deactivated", None)
+            if commit:
+                commit()
+
+    def auto_backup_before(self, reason, parent=None):
+        """되돌릴 수 없는 작업(가져오기/복원/달력메모 일괄삭제)을 하기 직전에 현재 전체 데이터를
+        backup_auto 폴더에 ZIP으로 자동 백업함. 백업은 파일이 아니라 지금 메모리에 있는 최신
+        데이터를 담음(backup_all과 같은 방식). 이 ZIP은 '백업에서 복원...'으로 그대로 되돌릴 수 있음.
+
+        반환: (계속 진행할지, 만든 백업 파일 경로 또는 None). 백업에 실패하면 사용자에게
+        백업 없이 계속할지 물어서 그 답을 반환함."""
+        parent = parent or self.root
+        try:
+            self._commit_inline_edits()
+            files = {}
+            for tab in self._transfer_tabs():
+                files[tab.transfer_filename] = json.dumps(
+                    tab.transfer_export_json(), ensure_ascii=False, indent=4)
+            return True, self.store.write_auto_backup(files, reason)
+        except Exception as e:
+            proceed = messagebox.askyesno(
+                "자동 백업 실패",
+                f"작업 전에 현재 데이터를 자동 백업하지 못했습니다.\n({e})\n\n"
+                "백업 없이 계속 진행하시겠습니까?",
+                icon="warning", parent=parent)
+            return proceed, None
+
+    @staticmethod
+    def backup_note(backup_path):
+        """자동 백업을 만들었을 때 완료 안내에 덧붙일 문구 (백업이 없으면 빈 문자열)"""
+        if not backup_path:
+            return ""
+        shown = os.path.join(AUTO_BACKUP_DIRNAME, os.path.basename(backup_path))
+        return (f"\n\n작업 전 데이터를 자동 백업해 두었습니다:\n{shown}\n"
+                "(되돌리려면 파일 > 백업에서 복원... 에서 이 파일을 선택하세요)")
 
     def backup_all(self):
         """파일 > 전체 백업 (zip)...: 모든 탭의 데이터 파일을 ZIP 하나로 묶어 저장.
         디스크의 파일이 아니라 지금 메모리에 있는 최신 데이터를 담으므로, 자동저장이
         아직 반영되지 않은 마지막 입력도 포함됨."""
         # 열려 있는 인라인 편집(컬렉션/체크리스트)을 먼저 확정해 백업에 포함시킴 (종료 시 저장과 같은 방식)
-        for tab in self.tabs:
-            commit = getattr(tab, "on_deactivated", None)
-            if commit:
-                commit()
+        self._commit_inline_edits()
         filepath = filedialog.asksaveasfilename(
             title="전체 백업", defaultextension=".zip",
             initialfile=f"AlpacaDiary_backup_{datetime.now():%Y%m%d_%H%M}.zip",
@@ -5518,8 +5829,12 @@ class MemoApp:
             kept = [tab.transfer_label for tab in tabs if tab.transfer_filename not in texts]
             if kept:
                 message += "\n\n백업에 없어 그대로 유지되는 데이터: " + ", ".join(kept)
-            message += "\n\n이 작업은 되돌릴 수 없습니다. 계속하시겠습니까?"
+            message += (f"\n\n실행 직전에 현재 데이터가 {AUTO_BACKUP_DIRNAME} 폴더에 자동 백업되며, "
+                        "필요하면 같은 메뉴에서 되돌릴 수 있습니다. 계속하시겠습니까?")
             if not messagebox.askyesno("백업에서 복원", message, icon="warning", parent=self.root):
+                return
+            proceed, backup_path = self.auto_backup_before("before-restore")
+            if not proceed:
                 return
 
             problems = []
@@ -5537,7 +5852,8 @@ class MemoApp:
                     "디스크 공간이나 저장 폴더의 쓰기 권한을 확인해주세요.",
                     parent=self.root)
             else:
-                messagebox.showinfo("성공", "백업에서 복원했습니다.", parent=self.root)
+                messagebox.showinfo("성공", "백업에서 복원했습니다." + self.backup_note(backup_path),
+                                    parent=self.root)
         except zipfile.BadZipFile:
             messagebox.showerror("오류", "올바른 ZIP 백업 파일이 아닙니다.", parent=self.root)
         except Exception as e:
@@ -5861,10 +6177,11 @@ class MemoApp:
         self.collection_tab._stop_polling()
         self.checklist_tab.on_deactivated()
         # 종료 전 설정 및 메모 저장 (창 크기, 위치 포함)
-        memos_ok = self.save_memos()
-        calendar_ok = self.save_calendar_memos()
-        collections_ok = self.save_collections()
-        checklists_ok = self.save_checklists()
+        # (저장에 실패하면 아래에서 한 번에 안내하므로, 개별 저장 실패 팝업은 띄우지 않음)
+        memos_ok = self.save_memos(notify=False)
+        calendar_ok = self.save_calendar_memos(notify=False)
+        collections_ok = self.save_collections(notify=False)
+        checklists_ok = self.save_checklists(notify=False)
         self.settings_mgr.save()
         if not (memos_ok and calendar_ok and collections_ok and checklists_ok):
             # 디스크 공간 부족/권한 문제 등으로 마지막 저장이 실패했는데도 그냥
@@ -5882,6 +6199,15 @@ class MemoApp:
 
 if __name__ == "__main__":
     set_windows_app_id()  # 반드시 tk.Tk() 생성 전에 호출
+    if not acquire_single_instance(get_app_dir()):
+        notice_root = tk.Tk()
+        notice_root.withdraw()
+        messagebox.showwarning(
+            "알파카 다이어리",
+            "알파카 다이어리가 이미 실행 중입니다.\n작업표시줄에서 열려 있는 창을 확인해 주세요.",
+            parent=notice_root)
+        notice_root.destroy()
+        sys.exit(0)
     root = tk.Tk()
     app = MemoApp(root)
     root.mainloop()
