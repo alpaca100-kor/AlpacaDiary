@@ -1,9 +1,11 @@
 """
 알파카 다이어리 (Alpaca Diary) — ad.py
 
-일반메모 / 달력메모 / 체크리스트 / 컬렉션 네 개의 탭으로 이루어진 메모 앱. 각 탭은 독립적인
-데이터 파일(memos.json / memos_calendar.json / checklists.json / collections.json)을 갖고,
-공통 UI 요소(글꼴/테마/단축키 등)는 공유한다.
+일반메모 / 달력메모 / 체크리스트 / 컬렉션 / 검색 다섯 개의 탭으로 이루어진 메모 앱. 앞의 네 탭은
+독립적인 데이터 파일(memos.json / memos_calendar.json / checklists.json / collections.json)을
+갖고, 검색 탭은 자기 데이터 없이 그 네 탭의 데이터를 한꺼번에 검색한다. 삭제한 항목은 네 탭
+공통의 휴지통(trash.json)에 모여 Ctrl+Shift+X로 복원할 수 있다. 공통 UI 요소(글꼴/테마/단축키
+등)는 모든 탭이 공유한다.
 """
 
 import tkinter as tk
@@ -23,6 +25,12 @@ import shutil
 import zipfile
 import codecs
 import hashlib
+import copy
+import time
+import socket
+import ssl
+import urllib.request
+import urllib.error
 from urllib.parse import urlparse
 from datetime import datetime, date, timedelta
 import calendar
@@ -46,6 +54,16 @@ try:
     import requests
 except ImportError:
     requests = None
+
+
+def log_message(message):
+    """진단용 메시지를 표준 출력에 남김. 콘솔 없는 exe에서는 stdout이 없고, 출력이 파일/파이프로 가면
+    cp949 같은 인코딩이 글자를 못 쓰기도 하는데, 로그 출력 실패가 저장/창 복원 같은 본 동작을
+    실패로 만들면 안 되므로 출력에 실패해도 무시함."""
+    try:
+        print(message)
+    except Exception:
+        pass
 
 
 def resource_path(relative_path):
@@ -123,6 +141,17 @@ def normalize_url(raw):
 
 # Excel 셀 하나에 넣을 수 있는 최대 글자 수
 XLSX_MAX_CELL_CHARS = 32767
+
+
+def shift_date_key(raw, delta, fallback):
+    """날짜 입력창의 ▲/▼: raw 날짜를 delta일 옮긴 "YYYY-MM-DD"를 반환함. raw가 올바른 날짜가 아니면
+    fallback 날짜를 기준으로 하고, 지원 연도 범위를 넘게 되면 옮기지 않고 그대로 둠."""
+    key = normalize_date_key(raw) or fallback
+    try:
+        moved = datetime.strptime(key, "%Y-%m-%d").date() + timedelta(days=delta)
+    except (ValueError, OverflowError):
+        return key
+    return normalize_date_key(moved.strftime("%Y-%m-%d")) or key
 
 
 def append_xlsx_row(ws, row):
@@ -259,6 +288,386 @@ def is_web_url(url):
     return parsed.scheme.lower() in ("http", "https") and bool(parsed.netloc)
 
 
+# ---- 통합검색(검색 탭)에서 각 탭이 함께 쓰는 함수들 ----
+
+# 검색 결과 목록에 한 번에 보여줄 최대 행 수 (그보다 많으면 앞쪽만 보여주고 안내함)
+SEARCH_MAX_RESULTS = 2000
+# 결과 한 줄에 보여줄 "일치한 곳 주변 문맥"의 길이(글자 수): 일치한 곳 앞/뒤
+SEARCH_SNIPPET_BEFORE = 10
+SEARCH_SNIPPET_AFTER = 40
+
+
+def parse_search_terms(query):
+    """검색어를 공백으로 나눈 단어 목록(소문자)으로 바꿈. 단어가 하나도 없으면 빈 리스트."""
+    return [word.lower() for word in query.split()]
+
+
+def text_matches_terms(lowered_text, terms):
+    """소문자로 바꾼 문자열에 terms의 단어가 모두 들어 있는지 (대소문자 구분 없는 검색의 기준)"""
+    return all(term in lowered_text for term in terms)
+
+
+def first_matching_term(text, terms):
+    """text에서 가장 앞쪽에 나오는 검색 단어를 돌려줌. 하나도 없으면 None."""
+    lowered = text.lower()
+    best = None
+    for term in terms:
+        pos = lowered.find(term)
+        if pos >= 0 and (best is None or pos < best[0]):
+            best = (pos, term)
+    return best[1] if best else None
+
+
+def make_search_snippet(text, terms):
+    """결과 목록 한 줄에 보여줄 문구: 줄바꿈/연속 공백을 한 칸으로 줄인 뒤, 검색 단어가 처음 나오는
+    곳의 앞뒤만 잘라서 돌려줌 (잘린 쪽은 …로 표시). 검색 단어가 text에 없으면(제목에만 일치한
+    경우 등) text의 앞부분을 돌려줌."""
+    flat = re.sub(r"\s+", " ", text).strip()
+    term = first_matching_term(flat, terms)
+    pos = flat.lower().find(term) if term else 0
+    start = max(0, pos - SEARCH_SNIPPET_BEFORE)
+    end = start + SEARCH_SNIPPET_BEFORE + SEARCH_SNIPPET_AFTER
+    snippet = flat[start:end].strip()
+    return ("…" if start > 0 else "") + snippet + ("…" if end < len(flat) else "")
+
+
+def place_cursor_at_term(widget, term):
+    """Text 위젯에서 term(소문자)이 처음 나오는 곳으로 커서를 옮기고 화면에 보이게 함 (검색 결과로
+    이동한 뒤 긴 메모에서 일치한 곳을 바로 찾도록). term이 없거나 찾지 못하면 아무 것도 하지 않음.
+
+    주의: Text.search(nocase=True)는 쓰지 않음. 내용에 이모지가 하나라도 있으면 일부 Tk 8.6 빌드에서
+    프로그램이 통째로 종료되는 문제가 있음. 대신 파이썬에서 대소문자 구분 없이 위치를 찾아 그 자리의
+    "원래 글자"를 알아낸 뒤, 그 글자를 대소문자 구분 검색(exact)으로 위젯에서 찾음. (그 글자가 이 위치보다
+    앞에 또 나올 수는 없으므로 처음 나오는 곳이 곧 이 위치임. 위치를 글자 수로 직접 계산하지 않고
+    위젯이 알려 주는 값을 쓰므로, Tk가 글자 수를 다르게 세는 이모지가 앞에 있어도 어긋나지 않음)"""
+    if not term:
+        return
+    content = widget.get("1.0", "end-1c")
+    pos = content.lower().find(term)
+    if pos < 0:
+        return
+    try:
+        index = widget.search(content[pos:pos + len(term)], "1.0", stopindex=tk.END, exact=True)
+    except tk.TclError:
+        return
+    if index:
+        widget.mark_set(tk.INSERT, index)
+        widget.see(index)
+
+
+# ---- 휴지통 (trash.json) ----
+# 일반메모/달력메모/체크리스트/컬렉션에서 지운 것을 한 곳(trash.json)에 모아 두고 복원할 수 있게 함.
+#
+# [파일 구조] 지운 것 하나 = entries 리스트의 항목 하나 (탭별 파일/구조를 따로 두지 않음):
+#   {"version": 1, "entries": [
+#       {"id": "<uuid>", "kind": "<종류>", "deleted_at": "2026-10-19T14:30:05",
+#        "data": {...지울 때의 내용 그대로...}, "origin": {...복원할 위치를 찾는 단서...}}, ...]}
+#
+#   kind              data                                            origin
+#   general_memo      {"title","content"}                             {"index"}
+#   calendar_memo     {"date","content"}                              {}
+#   checklist_item    {"id","content","checked","added"}              {"parent_id","parent_name","index"}
+#   checklist_folder  {"id","name","created","items":[...]}           {"index"}
+#   collection_item   {"id","title","url","memo","added"}             {"parent_id","parent_name","index"}
+#   collection        {"id","name","created","items":[...]}           {"index"}
+#
+# [설계 이유]
+#   - 모든 종류가 같은 틀(id/kind/deleted_at/data/origin)이라, 휴지통 창과 저장/불러오기/자동 삭제
+#     코드는 종류를 몰라도 되고, 복원 방법만 각 탭(trash_restore)이 앎. 종류가 늘어도 파일 구조가 안 바뀜.
+#   - data는 원래 데이터(memos.json 등에 저장되던 모양)를 그대로 담음: 항목 id를 보존하므로 복원하면
+#     같은 항목으로 돌아가고, 폴더/컬렉션은 안의 항목까지 통째로 담아 한 번에 복원됨.
+#   - origin은 "어디로 돌려놓을지"의 단서일 뿐이라 틀려도(그 사이 폴더가 지워지거나 항목 수가 바뀜)
+#     복원이 실패하지 않음: 순서(index)는 범위 안으로 보정하고, 부모 폴더가 없으면 같은 id/이름으로
+#     새로 만들고, 같은 폴더가 이미 있으면 항목만 합침. 달력메모는 그 날짜에 새 메모가 있으면 내용을
+#     덮어쓰지 않고 뒤에 이어 붙임. 어떤 경우에도 현재 데이터를 지우지 않음.
+#   - 휴지통은 백업/가져오기(내보내기) 대상이 아님: 백업은 "그 시점의 데이터"를 되돌리는 용도이고
+#     휴지통은 최근 삭제를 되돌리는 임시 보관함이라 성격이 다름. 파일도 따로 둬서 서로 영향을 안 줌.
+#   - 삭제한 지 TRASH_RETENTION_DAYS일이 지난 항목은 시작할 때/휴지통을 열 때 자동으로 완전히 지움.
+TRASH_FILE_VERSION = 1
+TRASH_RETENTION_DAYS = 30
+TRASH_KINDS = ("general_memo", "calendar_memo", "checklist_item", "checklist_folder",
+               "collection_item", "collection")
+
+
+def parse_iso_time(text):
+    """now_iso()로 저장한 시각 문자열을 datetime으로 바꿈 (해석할 수 없으면 None)"""
+    try:
+        return datetime.fromisoformat(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def format_trash_time(text):
+    """휴지통 목록에 보여줄 삭제 시각: "2026-10-19 14:30" (해석할 수 없으면 원문 그대로)"""
+    parsed = parse_iso_time(text)
+    return parsed.strftime("%Y-%m-%d %H:%M") if parsed else str(text)
+
+
+def is_trash_expired(entry, now=None):
+    """보관 기간(TRASH_RETENTION_DAYS)이 지난 항목인지. 삭제 시각을 해석할 수 없으면 지우지 않음"""
+    deleted_at = parse_iso_time(entry.get("deleted_at"))
+    if deleted_at is None:
+        return False
+    return (now or datetime.now()) - deleted_at > timedelta(days=TRASH_RETENTION_DAYS)
+
+
+def clamp_index(value, size):
+    """origin에 적힌 순서(index)를 0~size 범위로 보정함 (정수가 아니면 맨 끝)"""
+    if not isinstance(value, int) or isinstance(value, bool):
+        return size
+    return max(0, min(value, size))
+
+
+def add_simple_tooltip(widget, text):
+    """위젯에 마우스를 잠시 올려 두면 text를 노란 풍선말로 보여줌 (이 앱의 다른 풍선말과 같은 모양).
+    풍선말은 위젯 위쪽에, 오른쪽 끝을 위젯에 맞춰 띄움 (오른쪽 아래 버튼이라 화면 밖으로 안 나가도록)"""
+    state = {"tip": None, "after": None}
+
+    def hide(event=None):
+        if state["after"] is not None:
+            widget.after_cancel(state["after"])
+            state["after"] = None
+        if state["tip"] is not None:
+            state["tip"].destroy()
+            state["tip"] = None
+
+    def show():
+        state["after"] = None
+        tip = tk.Toplevel(widget)
+        tip.wm_overrideredirect(True)
+        try:
+            tip.wm_attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        tk.Label(tip, text=text, background="#ffffe0", foreground="#000000", relief=tk.SOLID,
+                 borderwidth=1, font=("맑은 고딕", 9), padx=4, pady=1).pack()
+        tip.update_idletasks()
+        x = max(0, widget.winfo_rootx() + widget.winfo_width() - tip.winfo_reqwidth())
+        y = max(0, widget.winfo_rooty() - tip.winfo_reqheight() - 4)
+        tip.wm_geometry(f"+{x}+{y}")
+        state["tip"] = tip
+
+    widget.bind("<Enter>", lambda e: state.__setitem__("after", widget.after(500, show)), add="+")
+    for sequence in ("<Leave>", "<ButtonPress>", "<Destroy>"):
+        widget.bind(sequence, hide, add="+")
+
+
+def make_trash_button(parent, app):
+    """각 탭의 [클립보드로 복사] 버튼 오른쪽에 두는 [🗑] 버튼 (누르면 휴지통 창이 열림)"""
+    button = ttk.Button(parent, text="🗑", width=3, command=app.open_trash)
+    add_simple_tooltip(button, "휴지통 (Ctrl+Shift+X)")
+    return button
+
+
+# ---- 병합 가져오기 (파일 > [탭] 병합하여 가져오기...) 에서 각 탭이 함께 쓰는 함수들 ----
+# 병합은 "가져온 파일의 내용을 기존 데이터에 더하기만" 함: 기존 항목을 지우거나 덮어쓰지 않으므로
+# (달력메모는 기존 내용 아래에 이어 붙임) 휴지통이 필요 없고, 잘못 병합했을 때는 실행 직전에 만든
+# 자동 백업(백업에서 복원...)으로 되돌림. 같은 파일을 두 번 병합해도 중복이 생기지 않게
+# "이미 있는 것"을 알아보는 규칙을 탭마다 둠:
+#   일반메모   제목+내용이 완전히 같은 메모 (id가 없음)
+#   달력메모   같은 날짜의 기존 메모 안에 그 내용이 빈 줄로 구분된 덩어리로 이미 들어 있음
+#   체크리스트  항목 id가 같고 내용도 같음 / 같은 폴더에 같은 내용의 항목이 있음
+#   컬렉션     항목 id가 같고 내용도 같음 / 같은 컬렉션에 같은 URL(없으면 같은 제목+메모)의 항목이 있음
+# 폴더/컬렉션은 id가 같으면 같은 것으로 보고, id가 달라도 이름이 같으면 하나로 합침.
+# id는 같은데 내용이 다른 항목(양쪽에서 따로 고친 경우)은 어느 쪽이 최신인지 알 수 없으므로
+# 기존 것은 두고 가져온 것을 새 항목으로 추가해 둘 다 보존함 ("충돌"로 알림).
+
+
+def text_has_block(existing, block):
+    """existing 안에 block이 이미 들어 있는지: 앞뒤가 빈 줄(또는 글의 처음/끝)로 구분된 덩어리일
+    때만 인정함. 글자 일부만 겹치는 경우(예: \"a\"가 \"banana\" 안에 있음)는 같은 내용으로 보지 않음.
+    달력메모를 이어 붙인 결과(기존 + 빈 줄 + 새 내용)를 다시 병합해도 중복되지 않게 하는 기준임."""
+    return f"\n\n{block.strip()}\n\n" in f"\n\n{existing.strip()}\n\n"
+
+
+def normalize_url_key(url):
+    """같은 주소를 같게 보기 위한 비교용 URL: 스킴/호스트는 소문자, 경로 끝의 /와 #조각은 무시함.
+    (경로와 쿼리의 대소문자는 서버마다 의미가 달라 그대로 둠). 주소로 읽을 수 없으면 공백만 뺀 원문"""
+    url = url.strip()
+    if not url:
+        return ""
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return url
+    if not parsed.scheme or not parsed.netloc:
+        return url
+    query = f"?{parsed.query}" if parsed.query else ""
+    return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{parsed.path.rstrip('/')}{query}"
+
+
+def new_unused_id(wanted, used):
+    """wanted가 used에 없으면 그대로(같은 항목의 id를 유지해 다음 병합에서도 알아볼 수 있게), 있으면
+    새 id를 돌려줌"""
+    result = wanted
+    while not result or result in used:
+        result = short_id()
+    return result
+
+
+def merge_parent_lists(existing_parents, incoming_parents, item_fields, item_key, item_same):
+    """체크리스트(폴더)와 컬렉션(컬렉션)의 병합 공용 로직. 둘은 "부모(폴더/컬렉션) 안에 항목 목록"이라는
+    같은 모양이라 규칙도 같고, 비교 방법만 다름.
+      existing_parents/incoming_parents : 기존/가져온 부모 리스트 ({"id","name","created","items":[...]})
+      item_fields : 항목에 복사할 필드 이름들 (id 제외)
+      item_key(item)       : 같은 부모 안에서 "같은 항목"인지 비교할 값 (이미 있으면 건너뜀)
+      item_same(a, b)      : id가 같은 두 항목의 내용이 같은지
+    기존 목록을 복사해서 합치고 (합친 부모 리스트, 통계 dict)를 반환함 (원본은 건드리지 않음).
+    통계: new_parents, merged_parents, added, conflicts, skipped"""
+    parents = copy.deepcopy(existing_parents)
+    by_id = {p["id"]: p for p in parents}
+    by_name = {}
+    for p in parents:
+        by_name.setdefault(p["name"].strip(), p)
+    item_by_id = {it["id"]: it for p in parents for it in p["items"]}
+    keys_by_parent = {}  # id(부모) → 그 부모 안의 항목 비교값 집합
+    stats = {"new_parents": 0, "merged_parents": 0, "added": 0, "conflicts": 0, "skipped": 0}
+
+    def merge_item(target, item):
+        keys = keys_by_parent.setdefault(id(target), {item_key(x) for x in target["items"]})
+        same = item_by_id.get(item["id"])
+        if same is not None and item_same(same, item):
+            return "skipped"        # 같은 항목이 이미 있음 (다른 폴더로 옮겨 놓은 경우 포함)
+        if item_key(item) in keys:
+            return "skipped"        # 이 부모에 같은 내용의 항목이 이미 있음
+        new_item = {"id": new_unused_id(item["id"], item_by_id)}
+        new_item.update({field: item[field] for field in item_fields})
+        target["items"].append(new_item)
+        item_by_id[new_item["id"]] = new_item
+        keys.add(item_key(new_item))
+        return "conflicts" if same is not None else "added"
+
+    for incoming in incoming_parents:
+        target = by_id.get(incoming["id"]) or by_name.get(incoming["name"].strip())
+        is_new = target is None
+        if is_new:
+            target = {"id": incoming["id"], "name": incoming["name"], "created": incoming["created"], "items": []}
+        results = {"added": 0, "conflicts": 0, "skipped": 0}
+        for item in incoming["items"]:
+            results[merge_item(target, item)] += 1
+        if is_new and incoming["items"] and not target["items"]:
+            stats["skipped"] += results["skipped"]  # 항목이 전부 이미 다른 곳에 있으면 빈 부모를 만들지 않음
+            continue
+        if is_new:
+            parents.append(target)
+            by_id[target["id"]] = target
+            by_name.setdefault(target["name"].strip(), target)
+            stats["new_parents"] += 1
+        else:
+            stats["merged_parents"] += 1
+        for name, count in results.items():
+            stats[name] += count
+    return parents, stats
+
+
+def merge_report_lines(stats, parent_label, item_label="항목"):
+    """merge_parent_lists의 통계를 미리보기/완료 안내에 쓸 문구 목록으로 바꿈"""
+    lines = []
+    if stats["new_parents"]:
+        lines.append(f"새로 추가: {parent_label} {stats['new_parents']}개")
+    if stats["merged_parents"]:
+        lines.append(f"기존 {parent_label}에 합침: {stats['merged_parents']}개 (id나 이름이 같은 {parent_label})")
+    lines.append(f"추가할 {item_label}: {stats['added']}개")
+    if stats["conflicts"]:
+        lines.append(f"충돌(같은 {item_label}인데 내용이 달라 새 {item_label}으로 추가): {stats['conflicts']}개")
+    if stats["skipped"]:
+        lines.append(f"이미 있어 건너뜀: {item_label} {stats['skipped']}개")
+    return lines
+
+
+# ---- 공휴일 편집 창 (달력메모 탭의 숨김 기능 Ctrl+Shift+H) ----
+# holidays.json은 {"YYYY-MM-DD": "공휴일 이름"} 형태이고, 평소에는 앱이 읽기만 함. 편집 창에서
+# [저장]을 눌렀을 때만 이 앱이 파일을 씀 (그때는 직전 파일을 holidays.json.bak으로 보관함).
+# GitHub에서 가져올 주소는 아래 상수로 고정함: 다른 저장소로 바꾸려면 HOLIDAYS_URL과
+# HOLIDAYS_ALLOWED_HOSTS(내려받기를 허용할 호스트)를 함께 고칠 것.
+HOLIDAYS_URL = "https://raw.githubusercontent.com/alpaca100-kor/AlpacaDiary/refs/heads/main/holidays.json"
+HOLIDAYS_ALLOWED_HOSTS = ("raw.githubusercontent.com",)
+HOLIDAYS_FETCH_TIMEOUT = 10        # 소켓 하나의 응답을 기다리는 최대 초
+HOLIDAYS_FETCH_TOTAL_SECONDS = 25  # 가져오기 전체를 기다리는 최대 초 (넘으면 화면에서 포기함)
+HOLIDAYS_MAX_BYTES = 1_000_000     # 내려받거나 읽을 파일의 최대 크기 (공휴일 파일은 수 KB라 넉넉한 상한)
+
+
+def clean_holidays(data):
+    """{날짜: 이름} 사전을 검증/정규화함: 날짜는 normalize_date_key로 바로잡고 이름은 비어 있지 않은
+    문자열이어야 함. (정상 항목 dict, 건너뛴 항목 설명 리스트)를 반환함. holidays.json 읽기와 편집 창의
+    GitHub/파일 가져오기가 모두 이 같은 규칙을 씀."""
+    problems = []
+    holidays = {}
+    for key, name in data.items():
+        norm = normalize_date_key(key)
+        if norm is None:
+            problems.append(f"{key!r}: 올바른 날짜(YYYY-MM-DD, {CAL_MIN_YEAR}~{CAL_MAX_YEAR}년)가 아닙니다")
+            continue
+        if not isinstance(name, str) or not name.strip():
+            problems.append(f"{key}: 공휴일 이름이 비어 있거나 문자열이 아닙니다")
+            continue
+        holidays[norm] = name.strip()
+    return holidays, problems
+
+
+def merge_holidays(current, incoming, replace=False):
+    """현재 목록(current)에 가져온 목록(incoming)을 반영한 결과를 계산함 (원본은 건드리지 않음).
+      병합(replace=False): 같은 날짜는 가져온 이름으로 바꾸고(가져온 쪽이 우선), 내 목록에만 있는 날짜는 유지
+      교체(replace=True) : 가져온 목록만 남김
+    (결과 dict, 통계 dict)를 반환함. 통계: added(새 날짜), changed(이름이 달라지는 날짜), same(변화 없음 개수),
+    local_only(가져온 쪽에 없는 날짜: 병합이면 유지, 교체면 사라짐)"""
+    added = sorted(d for d in incoming if d not in current)
+    changed = sorted(d for d in incoming if d in current and current[d] != incoming[d])
+    local_only = sorted(d for d in current if d not in incoming)
+    same = len(incoming) - len(added) - len(changed)
+    result = dict(incoming) if replace else {**current, **incoming}
+    return result, {"added": added, "changed": changed, "same": same, "local_only": local_only}
+
+
+class HolidayFetchError(Exception):
+    """GitHub에서 공휴일 파일을 가져오지 못했을 때 (메시지는 그대로 사용자에게 보여줄 수 있음)"""
+
+
+def fetch_holidays_text(url=HOLIDAYS_URL, timeout=HOLIDAYS_FETCH_TIMEOUT, max_bytes=HOLIDAYS_MAX_BYTES):
+    """url의 파일 내용을 텍스트로 내려받아 반환함. 실패하면 HolidayFetchError(사용자용 메시지).
+    표준 라이브러리 urllib을 씀 (requests는 선택 설치라 없을 수 있고, urllib은 Windows 인증서 저장소를
+    써서 사내 보안 프록시 환경에서도 SSL 오류가 덜 남). https와 허용한 호스트만 받고(연결이 다른
+    호스트로 넘어가도 중단), 크기 상한을 넘으면 중단함. 네트워크를 쓰므로 화면 스레드에서 직접
+    부르지 말 것 (편집 창이 별도 스레드에서 부름)."""
+    def allowed(address):
+        parsed = urlparse(address)
+        return parsed.scheme == "https" and parsed.hostname in HOLIDAYS_ALLOWED_HOSTS
+
+    if not allowed(url):
+        raise HolidayFetchError("허용되지 않은 주소입니다.")
+    request = urllib.request.Request(url, headers={
+        "User-Agent": "AlpacaDiary", "Accept": "application/json, text/plain, */*", "Cache-Control": "no-cache"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            if not allowed(response.geturl()):
+                raise HolidayFetchError("허용되지 않은 다른 주소로 연결되어 중단했습니다.")
+            raw = response.read(max_bytes + 1)
+    except HolidayFetchError:
+        raise
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            raise HolidayFetchError("GitHub에서 파일을 찾지 못했습니다 (404). 저장소 주소나 파일 위치를 확인해 주세요.")
+        raise HolidayFetchError(f"GitHub가 오류를 돌려주었습니다 (HTTP {e.code}).")
+    except urllib.error.URLError as e:
+        reason = e.reason
+        if isinstance(reason, ssl.SSLError):
+            raise HolidayFetchError("보안 연결(SSL) 확인에 실패했습니다. 사내 보안 프로그램이 연결을 가로채는 "
+                                    "환경일 수 있습니다.")
+        if isinstance(reason, (socket.timeout, TimeoutError)):
+            raise HolidayFetchError("응답 시간이 초과되었습니다. 네트워크 상태를 확인해 주세요.")
+        raise HolidayFetchError(f"인터넷에 연결하지 못했습니다 ({reason}). 접속이 차단된 네트워크일 수 있습니다.")
+    except (socket.timeout, TimeoutError):
+        raise HolidayFetchError("응답 시간이 초과되었습니다. 네트워크 상태를 확인해 주세요.")
+    except OSError as e:
+        raise HolidayFetchError(f"네트워크 오류가 발생했습니다 ({e.__class__.__name__}).")
+    if len(raw) > max_bytes:
+        raise HolidayFetchError("파일이 너무 커서 가져오지 않았습니다.")
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        raise HolidayFetchError("UTF-8 텍스트 파일이 아닙니다.")
+
+
 class EmptyTransferFileError(Exception):
     """가져오기/복원할 JSON 파일이 비어 있을 때 (구조 오류와 다른 안내문을 보여주기 위함)"""
 
@@ -371,6 +780,27 @@ UI_FONT = ("맑은 고딕", 12)
 # 본문 글꼴 크기 허용 범위 (글꼴 설정창 입력 검사와 settings.ini 로드에서 함께 사용)
 FONT_SIZE_MIN = 8
 FONT_SIZE_MAX = 72
+
+
+def apply_custom_styles(content_font):
+    """이 앱이 직접 정의하는 ttk 스타일(달력메모의 좁은 버튼, 최상단 탭, 체크리스트/컬렉션/검색
+    결과 목록의 글꼴·행 높이)을 현재 ttk 테마에 설정함.
+
+    ttk 스타일 설정은 테마별로 따로 저장되므로, 시작할 때 한 번만 설정하면 설정 > 테마 설정에서
+    라이트/다크를 바꾼 순간 새 테마에는 그 값이 없어 기본값(넓은 버튼 패딩, 기본 글꼴·행 높이)으로
+    돌아감. 그래서 sv_ttk.set_theme()을 부른 직후마다, 그리고 글꼴을 바꿀 때마다 이 함수를 불러야 함.
+    스타일 이름이 같은 위젯은 설정이 바뀌면 자동으로 다시 그려지므로 위젯을 새로 만들 필요는 없음."""
+    style = ttk.Style()
+    style.configure("CalNav.TButton", padding=(2, 4), width=1)
+    # 탭이 5개라 800×600(최소 크기)에서도 모두 보이도록 좌우 패딩을 줄임. 탭 하나의 폭은 "글자 폭 +
+    # 테마가 붙이는 여백(약 33px) + 좌우 패딩 2배"이고, 합계가 창 폭을 넘으면 ttk가 탭을 줄여 글자가
+    # 잘려 보이므로 24→6으로 낮춤. 글꼴을 키우거나 탭을 더 늘릴 때는 이 값부터 확인할 것
+    style.configure("TopLevel.TNotebook.Tab", font=("맑은 고딕", 13, "bold"), padding=(6, 4))
+    style.configure("TopLevel.TNotebook", tabmargins=(6, 8, 6, 0))
+    row_height = max(24, int(content_font[1] * 2.4))
+    for name in ("Checklist.Treeview", "Collection.Treeview", "Search.Treeview", "Trash.Treeview",
+                 "Holiday.Treeview"):
+        style.configure(name, font=content_font, rowheight=row_height)
 
 # 빠른 입력(Alt+1~Alt+0) 슬롯 키 순서: 1,2,...,9,0
 QUICK_INPUT_KEYS = [str(i) for i in range(1, 10)] + ["0"]
@@ -504,6 +934,8 @@ def apply_titlebar_theme(root, dark):
 #                    순서변경)에 항목을 완료 여부+내용으로 단순화함.
 # CollectionTab    : "컬렉션" 탭 전체(위젯+데이터+동작). 컬렉션/항목 CRUD, URL 제목
 #                    자동 수집, 순서 변경. 이미지 첨부 기능은 없음.
+# SearchTab        : "검색" 탭. 자기 데이터는 없고, 위 네 탭의 데이터를 한꺼번에 검색해
+#                    결과를 보여주며 결과를 열면 해당 탭의 해당 항목으로 이동시킴.
 # MemoApp          : 위를 조립하는 지휘자. 메뉴/전역 단축키/창 생명주기/
 #                    테마·상태표시줄처럼 "탭을 넘나드는" 것만 여기 남김.
 #
@@ -526,12 +958,35 @@ def apply_titlebar_theme(root, dark):
 #        - focus_list(self, event=None)       : Ctrl+L
 #        - on_page_up(self, event=None) / on_page_down(self, event=None)
 #        - insert_text_at_widget(self, widget, text) -> bool  : Alt+T / Alt+숫자
+#        [선택 - 검색 탭(통합검색)의 검색 대상이 되려면]
+#        - search_key / search_icon / search_label : 검색 범위 구분 키(예: "general") / 결과
+#                                               목록에 붙일 아이콘 / 체크박스·결과에 쓸 탭 이름
+#        - search_matches(self, terms) -> list : terms(소문자 단어 목록)가 모두 들어 있는 항목을
+#                                               [{"where": 위치 표시, "text": 일치한 문맥,
+#                                                 "target": 이동에 필요한 값}] 로 돌려줌
+#        - goto_search_result(self, target) -> bool : target 항목으로 이동하고 포커스를 줌.
+#                                               항목이 사라져 이동할 수 없으면 False
+#                                               (MemoApp.go_to_search_result가 먼저 이 탭을 화면에 띄운 뒤 호출함)
+#        [선택 - 휴지통(Ctrl+Shift+X)에 참여하려면: 파일 위 "휴지통" 주석에 구조와 설계 이유가 있음]
+#        - trash_kinds = ("종류", ...)           : 이 탭이 맡는 휴지통 항목 종류 (TRASH_KINDS에 있는 값)
+#        - 지울 때: 지우기 직전에 app.trash_add(kind, data, origin) 호출 (여러 개면 trash_add_many)
+#        - trash_describe(self, entry) -> dict  : 휴지통 창에 보여줄 {"where","text","detail"}
+#        - trash_restore(self, entry) -> (안내 문구, 이동 대상) : 데이터에만 되돌림 (이미 있는 데이터를
+#                                               지우지 않도록 겹치면 합치거나 새 id를 받음). 복원할 수 없으면
+#                                               ValueError(이유). 화면 갱신/저장은 하지 않음
+#        - trash_finish_restore(self, targets)  : 한 번에 복원한 항목들의 이동 대상 목록을 받아 저장하고
+#                                               화면을 갱신하며 마지막 항목을 선택함
+#        - 하단 [클립보드로 복사] 옆에는 make_trash_button(부모, app)으로 [🗑] 버튼을 둠
 #        [선택 - 파일 메뉴의 가져오기/내보내기/전체 백업·복원에 참여하려면]
 #        - transfer_label / transfer_filename : 탭 이름(예: "달력메모") / 데이터 파일명
 #                                               (예: "memos_calendar.json" - 백업 ZIP 안의 이름)
 #        - transfer_parse(raw) -> data        : 가져온 JSON을 검증/정규화 (잘못되면 TypeError/ValueError)
 #        - transfer_apply(data) -> bool       : 데이터를 교체하고 저장·화면 갱신 (저장 성공 여부 반환)
 #        - transfer_summary(data) -> str      : 복원 확인창에 보여줄 요약 (예: "메모 12개")
+#        - transfer_merge(data) -> (합친 data, {"changes": 개수, "lines": [안내 문구]}) : "병합하여
+#                                               가져오기"용. 가져온 data(transfer_parse 결과)를 기존 데이터에
+#                                               더한 결과를 계산만 함(원본/화면을 건드리지 않음). 기존 것은
+#                                               지우거나 덮어쓰지 않고 추가만 하며, 규칙은 파일 위 "병합 가져오기" 주석 참고
 #        - transfer_export_json() -> data     : 내보내기/백업에 쓸 현재 데이터
 #        - transfer_export_txt() -> str       : TXT 내보내기 내용 (보관·열람용)
 #        - transfer_export_xlsx() -> (시트 이름, 머리글 리스트, 행 리스트)  (보관·열람용)
@@ -558,7 +1013,7 @@ class WriteBlockedError(OSError):
 
 
 class MemoStore:
-    """memos.json / memos_calendar.json / collections.json / checklists.json /
+    """memos.json / memos_calendar.json / collections.json / checklists.json / trash.json /
     settings.ini / quick_inputs.json / holidays.json 파일 입출력만 담당. tkinter
     위젯을 전혀 참조하지 않으므로 GUI 없이도 단위 테스트가 가능함. 저장할 데이터는
     항상 인자로 받고(self가 데이터를 들고 있지 않음), 읽은 데이터는 검증해서 반환하며,
@@ -573,6 +1028,7 @@ class MemoStore:
         self.holiday_file = os.path.join(app_dir, "holidays.json")
         self.collections_file = os.path.join(app_dir, "collections.json")
         self.checklists_file = os.path.join(app_dir, "checklists.json")
+        self.trash_file = os.path.join(app_dir, "trash.json")
         # 시작할 때 읽지 못했거나 일부를 건너뛴 데이터 파일 안내 문구 (시작 후 MemoApp이 한 번 보여줌)
         self.load_problems = []
         # 열지 못해서(사용 중/권한) 빈 데이터로 시작한 파일의 경로. 종료할 때의 자동 저장이 읽지 못한
@@ -756,31 +1212,62 @@ class MemoStore:
             self._atomic_write_json(self.file_path, memos)
             return True
         except Exception as e:
-            print(f"❌ 메모 저장 실패: {e}")
+            log_message(f"메모 저장 실패: {e}")
             return False
 
     def load_holidays(self):
         """대한민국 공휴일을 holidays.json에서 불러옴 (없거나 손상되었으면 빈 딕셔너리).
-        {"YYYY-MM-DD": "공휴일 이름"} 형태이며, 앱이 쓰지는 않는 참고용 파일이라 최신 연도를
-        쓰려면 직접 교체/추가해야 함. 직접 편집하다 생긴 오타가 달력/목록에 영향을 주지 않도록
+        {"YYYY-MM-DD": "공휴일 이름"} 형태이며, 앱이 평소에 쓰지는 않는 참고용 파일임 (최신 연도는
+        달력메모 탭의 숨김 기능 Ctrl+Shift+H 편집 창이나 직접 편집으로 추가/교체함). 직접 편집하다 생긴
+        오타가 달력/목록에 영향을 주지 않도록
         항목마다 검증해(날짜는 normalize_date_key, 이름은 비어 있지 않은 문자열) 올바른 것만
         쓰고, 건너뛴 항목은 self.holiday_problems에 기록함(시작 후 한 번 안내함)."""
         self.holiday_problems = []
         data = self._read_json(self.holiday_file, lambda d: isinstance(d, dict), quarantine=False)
         if data is NO_DATA:
             return {}
-        holidays = {}
-        for key, name in data.items():
-            norm = normalize_date_key(key)
-            if norm is None:
-                self.holiday_problems.append(
-                    f"{key!r}: 올바른 날짜(YYYY-MM-DD, {CAL_MIN_YEAR}~{CAL_MAX_YEAR}년)가 아닙니다")
-                continue
-            if not isinstance(name, str) or not name.strip():
-                self.holiday_problems.append(f"{key}: 공휴일 이름이 비어 있거나 문자열이 아닙니다")
-                continue
-            holidays[norm] = name.strip()
+        holidays, self.holiday_problems = clean_holidays(data)
         return holidays
+
+    def read_holidays_for_editing(self):
+        """공휴일 편집 창을 열 때 holidays.json을 디스크에서 새로 읽음 (메모리에 있던 값이 아니라 파일을 읽는
+        이유: 그 사이 메모장 등으로 고친 내용을 편집 창이 덮어쓰지 않도록). (정상 항목 dict, 건너뛴 항목
+        설명 리스트, 읽지 못한 이유 또는 None)을 반환함. 파일이 없거나 비어 있으면 빈 dict(이유 없음).
+        읽지 못했다면(JSON이 아님/구조가 다름/열 수 없음) 빈 dict와 이유를 돌려주며, 이때 저장하면
+        기존 파일은 holidays.json.bak으로 보관된 뒤 새로 만들어짐. load_problems는 건드리지 않음."""
+        try:
+            with open(self.holiday_file, "r", encoding="utf-8-sig") as f:
+                text = f.read()
+        except FileNotFoundError:
+            return {}, [], None
+        except (OSError, UnicodeDecodeError) as e:
+            return {}, [], f"holidays.json을 읽지 못했습니다 ({e.__class__.__name__})."
+        if not text.strip():
+            return {}, [], None
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            return {}, [], "holidays.json이 올바른 JSON 파일이 아니라서 읽지 못했습니다."
+        if not isinstance(data, dict):
+            return {}, [], "holidays.json이 {날짜: 이름} 형태가 아니라서 읽지 못했습니다."
+        holidays, problems = clean_holidays(data)
+        return holidays, problems, None
+
+    def holidays_signature(self):
+        """holidays.json이 바뀌었는지 비교하기 위한 값 (수정 시각, 크기). 파일이 없으면 None"""
+        try:
+            info = os.stat(self.holiday_file)
+        except OSError:
+            return None
+        return (info.st_mtime_ns, info.st_size)
+
+    def write_holidays(self, holidays, backup=True):
+        """holidays.json을 날짜순으로 정렬해 원자적으로 저장함. backup=True면 쓰기 전에 기존 파일을
+        holidays.json.bak으로 복사해 둠 (편집 창이 한 번 열려 있는 동안은 첫 저장에서만 만들어, 그 창을
+        열 때의 파일이 보관되게 함). 실패하면 예외를 그대로 전달함 (호출한 쪽이 안내함)."""
+        if backup and os.path.exists(self.holiday_file):
+            shutil.copyfile(self.holiday_file, self.holiday_file + ".bak")
+        self._atomic_write_json(self.holiday_file, dict(sorted(holidays.items())))
 
     def load_calendar_memos(self):
         """달력메모(memos_calendar.json)를 불러옴: {"YYYY-MM-DD": "내용", ...} 형태.
@@ -802,7 +1289,7 @@ class MemoStore:
             self._atomic_write_json(self.calendar_file_path, dict(sorted(calendar_memos.items())))
             return True
         except Exception as e:
-            print(f"❌ 달력메모 저장 실패: {e}")
+            log_message(f"달력메모 저장 실패: {e}")
             return False
 
     def load_quick_inputs(self):
@@ -817,7 +1304,7 @@ class MemoStore:
             self._atomic_write_json(self.quick_input_file, quick_inputs)
             return True
         except Exception as e:
-            print(f"❌ 빠른 입력 저장 실패: {e}")
+            log_message(f"빠른 입력 저장 실패: {e}")
             return False
 
     def load_settings(self):
@@ -881,10 +1368,9 @@ class MemoStore:
         }
         try:
             self._atomic_write(self.settings_file, config.write)
-            print(f"✅ 설정 저장: {settings.get('window_geometry')}")
             return True
         except Exception as e:
-            print(f"❌ 설정 저장 실패: {e}")
+            log_message(f"설정 저장 실패: {e}")
             return False
 
     def load_collections(self):
@@ -929,7 +1415,7 @@ class MemoStore:
             self._atomic_write_json(self.collections_file, data)
             return True
         except Exception as e:
-            print(f"❌ 컬렉션 저장 실패: {e}")
+            log_message(f"컬렉션 저장 실패: {e}")
             return False
 
     def load_checklists(self):
@@ -972,7 +1458,44 @@ class MemoStore:
             self._atomic_write_json(self.checklists_file, data)
             return True
         except Exception as e:
-            print(f"❌ 체크리스트 저장 실패: {e}")
+            log_message(f"체크리스트 저장 실패: {e}")
+            return False
+
+    def load_trash(self):
+        """trash.json 로드: {"version", "entries": [{"id","kind","deleted_at","data","origin"}]} 형태
+        (구조와 설계 이유는 파일 위 "휴지통" 주석 참고). 파일이 없거나 손상되었으면 빈 목록을 반환하고
+        (손상이면 원본은 보관), 알 수 없는 종류이거나 형식이 틀린 항목은 건너뛰되 원본을 복사해 둠."""
+        data = self._read_json(
+            self.trash_file,
+            lambda d: isinstance(d, dict) and isinstance(d.get("entries"), list))
+        if data is NO_DATA:
+            return []
+        seen_ids, cleaned, skipped = set(), [], 0
+        for raw in data["entries"]:
+            if not (isinstance(raw, dict) and raw.get("kind") in TRASH_KINDS
+                    and isinstance(raw.get("data"), dict)):
+                skipped += 1
+                continue
+            origin = raw.get("origin")
+            cleaned.append({
+                "id": unique_id(raw.get("id"), seen_ids),
+                "kind": raw["kind"],
+                "deleted_at": str(raw.get("deleted_at", "")),
+                "data": raw["data"],
+                "origin": origin if isinstance(origin, dict) else {},
+            })
+        if skipped:
+            self._preserve_original(
+                self.trash_file, f"알 수 없는 종류이거나 형식이 올바르지 않은 휴지통 항목 {skipped}개를 건너뛰었습니다.",
+                move=False)
+        return cleaned
+
+    def save_trash(self, entries):
+        try:
+            self._atomic_write_json(self.trash_file, {"version": TRASH_FILE_VERSION, "entries": entries})
+            return True
+        except Exception as e:
+            log_message(f"휴지통 저장 실패: {e}")
             return False
 
 
@@ -1026,7 +1549,9 @@ class SettingsManager:
         settings_win.bind("<Escape>", lambda e: cancel_action())
 
         ttk.Label(settings_win, text="글꼴:", font=UI_FONT).grid(row=0, column=0, padx=10, pady=10, sticky="w")
-        font_families = sorted(font.families())
+        # Windows는 "@맑은 고딕"처럼 세로쓰기용 폰트를 가로쓰기 폰트와 함께 돌려주므로 제외하고,
+        # 같은 이름이 여러 번 나오지 않게 중복도 없앰
+        font_families = sorted({f for f in font.families() if not f.startswith("@")})
         font_var = tk.StringVar(value=self.content_font[0])
         font_combo = ttk.Combobox(settings_win, textvariable=font_var, values=font_families, state="readonly")
         font_combo.grid(row=0, column=1, padx=10, pady=10, sticky="ew")
@@ -1054,6 +1579,7 @@ class SettingsManager:
             self.content_font = (new_font_family, new_font_size)
             for tab in self.app.tabs:
                 tab.set_content_font(self.content_font)
+            apply_custom_styles(self.content_font)  # 목록 글꼴/행 높이 (현재 테마)
             self.settings["font_family"] = new_font_family
             self.settings["font_size"] = new_font_size
             self.save()
@@ -1141,6 +1667,7 @@ class SettingsManager:
             self.settings["theme_mode"] = new_mode
             if sv_ttk:
                 sv_ttk.set_theme(new_mode, self.app.root)
+            apply_custom_styles(self.content_font)  # 스타일 설정은 테마별이라 새 테마에 다시 설정
             apply_titlebar_theme(self.app.root, new_mode == "dark")
             self.app.apply_theme_colors()
             self.save()
@@ -1282,6 +1809,8 @@ class GeneralMemoTab:
         self.content_text.bind("<KeyRelease>", lambda event: self.update_memo_realtime(event, update_list=False))
         self.content_text.bind("<ButtonRelease-1>", self.app.update_status_bar)
         self.content_text.bind("<Control-t>", self.app.focus_on_title)
+        # Tk Text의 기본 Ctrl+F(커서를 한 칸 앞으로)가 먼저 실행되지 않도록 여기서 가로챔
+        self.content_text.bind("<Control-f>", self.app.focus_search)
 
         # 복사 버튼과 복사 완료 메시지를 위한 프레임
         copy_frame = ttk.Frame(right_panel)
@@ -1292,6 +1821,7 @@ class GeneralMemoTab:
 
         self.copy_button = ttk.Button(copy_frame, text="클립보드로 복사", command=self.app.copy_to_clipboard)
         self.copy_button.pack(side=tk.LEFT)
+        make_trash_button(copy_frame, self.app).pack(side=tk.LEFT, padx=(6, 0))
 
     # ---- MemoApp이 공통으로 호출하는 인터페이스 ----
 
@@ -1472,11 +2002,14 @@ class GeneralMemoTab:
 
     def remove_memo(self):
         if self.current_index == -1:
-            messagebox.showwarning("경고", "삭제할 메모를 선택하세요.")
+            messagebox.showwarning("경고", "삭제할 메모를 선택하세요.", parent=self.app.root)
             return
-        if messagebox.askyesno("확인", "선택한 메모를 제거하시겠습니까?"):
+        if messagebox.askyesno("확인", "선택한 메모를 제거하시겠습니까?", parent=self.app.root):
             removed_index = self.current_index
             top_before = self.listbox.nearest(0)
+            # 휴지통에 먼저 넣은 뒤 지움 (MemoApp.trash_add 설명 참고)
+            if not self.app.trash_add("general_memo", self.memos[removed_index], {"index": removed_index}):
+                return  # 휴지통에 보관하지 못했고 사용자가 삭제를 취소함
             del self.memos[removed_index]
             self.current_index = -1
             self.title_entry.delete(0, tk.END)
@@ -1491,6 +2024,7 @@ class GeneralMemoTab:
                 # 목록 맨 위 근처로 튀므로 삭제한 자리로 되돌림 (선택은 하지 않음)
                 self.listbox.activate(min(removed_index, len(self.memos) - 1))
             self.app.save_memos()
+            self.app.show_status_message("메모를 휴지통으로 옮겼습니다. (복원: Ctrl+Shift+X)")
 
     def move_memo_up(self):
         if self.current_index > 0:
@@ -1565,7 +2099,14 @@ class GeneralMemoTab:
         # "end-1c": Text가 항상 끝에 붙이는 개행 한 글자만 제외함. .strip()은 사용자가 넣은
         # 끝줄 공백/빈 줄까지 지우므로 쓰지 않고 원본 그대로 저장함
         content = self.content_text.get("1.0", "end-1c")
-        self.memos[self.current_index] = {"title": title, "content": content}
+        new_memo = {"title": title, "content": content}
+        if self.memos[self.current_index] == new_memo:
+            # 방향키/Shift/Ctrl 같은 키는 KeyRelease는 발생시키지만 내용은 그대로임. 이때 저장을
+            # 예약하면 memos.json 전체가 헛되이 다시 쓰이므로(클라우드 동기화 폴더에서는 특히 낭비)
+            # 건너뜀. 커서 위치가 바뀌었을 수 있으니 상태표시줄만 갱신함
+            self.app.update_status_bar()
+            return
+        self.memos[self.current_index] = new_memo
 
         if update_list:
             # 전체 delete(0, END)+재삽입 대신, 바뀐 항목 하나만 갱신
@@ -1655,13 +2196,33 @@ class GeneralMemoTab:
 
     def transfer_apply(self, data):
         self.memos = data
-        ok = self.app.save_memos()
+        ok = self.app.save_memos(notify=False)  # 실패는 호출한 쪽(가져오기/복원)이 직접 안내함
         self.current_index = -1
         self.title_entry.delete(0, tk.END)
         set_text_content(self.content_text)
         self.toggle_right_panel(False)
         self.update_listbox()
         return ok
+
+    def transfer_merge(self, incoming):
+        """가져온 메모(transfer_parse 결과)를 기존 메모 뒤에 더함. 제목+내용이 완전히 같은 메모는 이미
+        있는 것으로 보고 건너뜀 (id가 없어서 이것이 같은 메모인지 알아보는 유일한 기준임).
+        화면/데이터는 건드리지 않고 (합친 리스트, {"changes": 추가 개수, "lines": 안내 문구들})를 반환함"""
+        merged = [dict(memo) for memo in self.memos]
+        seen = {(memo["title"], memo["content"]) for memo in merged}
+        added = skipped = 0
+        for memo in incoming:
+            key = (memo["title"], memo["content"])
+            if key in seen:
+                skipped += 1
+                continue
+            seen.add(key)
+            merged.append(dict(memo))
+            added += 1
+        lines = [f"추가할 메모: {added}개"]
+        if skipped:
+            lines.append(f"이미 있어 건너뜀: 메모 {skipped}개")
+        return merged, {"changes": added, "lines": lines}
 
     def transfer_export_json(self):
         return self.memos
@@ -1674,6 +2235,79 @@ class GeneralMemoTab:
     def transfer_export_xlsx(self):
         return "메모", ["제목", "내용"], [[memo["title"], memo["content"]] for memo in self.memos]
 
+    # ---- 통합검색 (검색 탭이 호출함 - 파일 위 "앱 구조 안내" 참고) ----
+
+    search_key = "general"
+    search_icon = "📝"
+    search_label = "일반메모"
+
+    def search_matches(self, terms):
+        """제목+내용에 terms의 단어가 모두 들어 있는 메모를 찾음"""
+        results = []
+        for index, memo in enumerate(self.memos):
+            title, content = memo["title"], memo["content"]
+            if not text_matches_terms(f"{title}\n{content}".lower(), terms):
+                continue
+            results.append({
+                "where": title or "(제목 없음)",
+                "text": make_search_snippet(content, terms),
+                # 메모에는 id가 없어서, 검색한 시점의 메모 내용(memo)을 함께 기억해 두었다가
+                # 이동할 때 그 자리에 아직 같은 메모가 있는지 확인함
+                "target": {"index": index, "memo": dict(memo),
+                           "term": first_matching_term(content, terms)},
+            })
+        return results
+
+    def goto_search_result(self, target):
+        """목록에서 그 메모를 선택하고 내용 편집창의 커서를 일치한 곳에 둠. 검색한 뒤 메모가 지워지거나
+        고쳐져서 같은 메모를 찾을 수 없으면 False (다른 메모로 잘못 이동하지 않도록 내용이 완전히
+        같은 메모만 같은 메모로 인정함)"""
+        memo, index = target["memo"], target["index"]
+        if not (0 <= index < len(self.memos) and self.memos[index] == memo):
+            index = next((i for i, m in enumerate(self.memos) if m == memo), None)
+            if index is None:
+                return False
+        self.listbox.selection_clear(0, tk.END)
+        self.listbox.selection_set(index)
+        self.listbox.activate(index)
+        self.listbox.see(index)
+        self.on_memo_select(None)
+        place_cursor_at_term(self.content_text, target["term"])
+        self.content_text.focus_set()
+        self.app.update_status_bar()
+        return True
+
+    # ---- 휴지통 (MemoApp.restore_from_trash가 호출함 - 파일 위 "앱 구조 안내" 참고) ----
+
+    trash_kinds = ("general_memo",)
+
+    def trash_describe(self, entry):
+        """휴지통 창에 보여줄 위치/내용 요약/전체 내용"""
+        title = str(entry["data"].get("title", ""))
+        content = str(entry["data"].get("content", ""))
+        return {"where": title or "(제목 없음)", "text": make_search_snippet(content, []),
+                "detail": f"제목: {title}\n\n{content}"}
+
+    def trash_restore(self, entry):
+        """지운 메모를 원래 순서(없어졌으면 가능한 가장 가까운 자리)에 다시 넣음. (안내 문구, 이동 대상)을
+        반환함. 화면/저장은 trash_finish_restore가 한꺼번에 처리함"""
+        data = entry["data"]
+        memo = {"title": str(data.get("title", "")), "content": str(data.get("content", ""))}
+        index = clamp_index(entry["origin"].get("index"), len(self.memos))
+        self.memos.insert(index, memo)
+        return "", {"index": index}
+
+    def trash_finish_restore(self, targets):
+        """복원이 끝난 뒤 목록을 다시 그리고, 마지막으로 복원한 메모를 선택해 보여줌 (새 메모 추가와 같은 방식)"""
+        index = targets[-1]["index"]
+        self.update_listbox(preserve_scroll=True)
+        self.listbox.selection_clear(0, tk.END)
+        self.listbox.selection_set(index)
+        self.listbox.activate(index)
+        self.listbox.see(index)
+        self.on_memo_select(None)
+        return self.app.save_memos()
+
 class CalendarMemoTab:
     """"달력메모" 탭: 왼쪽 달력([월별보기]/[1년전체보기]/[목록보기]) + 오른쪽 날짜별 메모 내용."""
 
@@ -1682,7 +2316,15 @@ class CalendarMemoTab:
         self.calendar_memos = app.store.load_calendar_memos()
         self.holidays = app.store.load_holidays()  # {"YYYY-MM-DD": "공휴일 이름"} - 참고용
         self._holiday_tooltip = None  # 공휴일 이름 풍선말 Toplevel (없으면 None)
+        self._holiday_dialog = None  # 공휴일 편집 창 (열려 있지 않으면 None, on_ctrl_shift_h 참고)
         self.weekday_label_widgets = []  # (라벨위젯, "sun"|"sat"|"normal") - 테마 갱신용
+        # 날짜 칸 위젯 목록 {그리드 프레임: {날짜: (Canvas, 행, 열, 일자, 종류)}}. 날짜를 선택할 때
+        # 그리드 전체(약 370칸)를 다시 만들지 않고 바뀌는 칸만 다시 그리기 위함 (_redraw_cells_only)
+        self._day_cells = {}
+        # 각 그리드를 마지막으로 그렸을 때의 "오늘" 날짜. 자정이 지나 "오늘" 표시가 달라졌을 때만
+        # 탭에 들어오며 다시 그리기 위함 (on_activated)
+        self._month_rendered_day = None
+        self._year_rendered_day = None
 
         now = datetime.now()
         self.cal_year, self.cal_month = now.year, now.month
@@ -1705,8 +2347,8 @@ class CalendarMemoTab:
         # 기본 ttk 버튼은 좌우 패딩이 넓어 고정폭 안에 여러 개를 놓으면 잘리므로, 이 좌측
         # 영역(cal_left)의 버튼들(아래 공용 4버튼과 월별보기의 이전/오늘/다음)은 패딩을 줄인
         # 전용 스타일을 공유함
-        nav_btn_style = ttk.Style()
-        nav_btn_style.configure("CalNav.TButton", padding=(2, 4), width=1)
+        # (CalNav.TButton 스타일은 apply_custom_styles()가 정의함 - 테마를 바꿔도 유지되도록
+        # 이 탭이 아니라 MemoApp이 테마 적용 직후마다 설정함)
 
         # [추가]/[제거]/[◀이전]/[다음▶] 버튼 - 달력 영역(cal_left) 맨 아래, 상태표시줄 바로 위.
         # side=BOTTOM으로 먼저 배치해야 아래에서 expand=True로 채워지는 노트북이 이 영역을
@@ -1782,8 +2424,8 @@ class CalendarMemoTab:
         for c in range(7):
             m_nav2.grid_columnconfigure(c + 1, minsize=CAL_CELL_W + 2)
 
-        # "CalNav.TButton" 스타일(좌우 패딩을 줄여 2칸(84px)에 정확히 맞춤)은 위
-        # cal_nav_buttons 블록에서 이미 정의해뒀으므로 여기서는 재사용만 함
+        # "CalNav.TButton" 스타일(좌우 패딩을 줄여 2칸(84px)에 정확히 맞춤)은
+        # apply_custom_styles()에서 정의하므로 여기서는 재사용만 함
         ttk.Button(m_nav2, text="◀", style="CalNav.TButton",
                    command=lambda: self.go_to_month(self.cal_year, self.cal_month - 1)
                    ).grid(row=0, column=1, columnspan=2, sticky="nsew", padx=1, pady=1, ipady=4)
@@ -1915,12 +2557,15 @@ class CalendarMemoTab:
         # break로 가로챔 (Listbox의 기본 B1-Motion 동작을 막을 때와 같은 방식)
         self.date_content_text.bind("<Prior>", self.app._on_prior_key)
         self.date_content_text.bind("<Next>", self.app._on_next_key)
+        # Tk Text의 기본 Ctrl+F(커서를 한 칸 앞으로)가 먼저 실행되지 않도록 여기서 가로챔
+        self.date_content_text.bind("<Control-f>", self.app.focus_search)
 
         date_copy_frame = ttk.Frame(cal_right)
         date_copy_frame.pack(anchor="e", pady=5)
         self.date_copy_status_label = ttk.Label(date_copy_frame, text="", font=("맑은 고딕", 11, "bold"))
         self.date_copy_status_label.pack(side=tk.LEFT, padx=(0, 10))
         ttk.Button(date_copy_frame, text="클립보드로 복사", command=self.app.copy_to_clipboard).pack(side=tk.LEFT)
+        make_trash_button(date_copy_frame, self.app).pack(side=tk.LEFT, padx=(6, 0))
 
     # ---- MemoApp이 공통으로 호출하는 인터페이스 ----
 
@@ -1996,15 +2641,20 @@ class CalendarMemoTab:
 
     def on_activated(self, event=None):
         """탭 전환으로 이 탭이 선택되는 순간 호출됨.
-        "오늘" 표시가 최신 날짜를 반영하도록 다시 그림(자정 경과 대비)."""
+        "오늘" 표시가 최신 날짜를 반영하도록 다시 그림(자정 경과 대비). 달력 그리드는 날짜 칸이
+        수백 개라 다시 만드는 데 시간이 걸리므로, 마지막으로 그린 뒤 날짜가 바뀌지 않았고 갱신이
+        미뤄진 표시(stale)도 없으면 그대로 둠."""
+        today = self._today_str()
         if self._is_year_view_active():
-            self.render_year_view()
+            if getattr(self, "_year_view_stale", False) or self._year_rendered_day != today:
+                self.render_year_view()
             self._year_view_stale = False
         elif self._is_list_view_active():
             self._refresh_date_list()
             self._list_view_stale = False
         else:
-            self.render_month_view()
+            if getattr(self, "_month_view_stale", False) or self._month_rendered_day != today:
+                self.render_month_view()
             self._month_view_stale = False
 
     # ---- 탭 전용/공통 단축키 인터페이스 (MemoApp이 활성 탭에 위임함) ----
@@ -2155,6 +2805,9 @@ class CalendarMemoTab:
         선택되어 있고 메모 유무도 바뀌지 않으므로 목록을 다시 그릴 필요가 없음."""
         if normalize_date_key(date_key) is None:
             return  # 지원 연도(CAL_MIN_YEAR~CAL_MAX_YEAR) 밖의 흐린 날짜 칸
+        prev_selected = self.selected_date
+        prev_month_view = (self.cal_year, self.cal_month)
+        prev_year_view = self.cal_year_year
         try:
             y, m, _ = date_key.split("-")
             self.cal_year, self.cal_month = int(y), int(m)
@@ -2166,34 +2819,50 @@ class CalendarMemoTab:
         self.date_label_var.set(self._format_date_label(date_key))
         set_text_content(self.date_content_text, self.calendar_memos.get(date_key, ""))
         self._update_remove_date_memo_button_state()
-        self._refresh_calendar_views(redraw_list=redraw_list)
+        # 보이는 달/해가 그대로면 이전 선택 칸과 새 선택 칸(메모 유무가 바뀐 경우 포함)만 다시 그림.
+        # 다른 달/해로 이동했다면 그리드 전체를 다시 그림
+        self._refresh_calendar_views(
+            redraw_list=redraw_list,
+            changed_dates=(date_key, prev_selected),
+            moved_month=(self.cal_year, self.cal_month) != prev_month_view,
+            moved_year=self.cal_year_year != prev_year_view)
         self.app.update_status_bar()
 
     def go_to_adjacent_memo_date(self, direction):
         """[◀이전]/[다음▶] 버튼 및 PageUp(-1)/PageDown(+1): 메모가 있는 날짜 중 현재 선택된
         날짜보다 이전/이후인 가장 가까운 날짜로 이동.
-        (현재 선택된 날짜 자체에 메모가 없어도, 그 날짜를 기준으로 찾는다)"""
+        (현재 선택된 날짜 자체에 메모가 없어도, 그 날짜를 기준으로 찾는다)
+        더 이동할 메모가 없으면 PageUp/PageDown을 연달아 눌러도 흐름이 끊기지 않도록 팝업 대신
+        상태표시줄에 잠깐 알림."""
         if direction < 0:
             candidates = [d for d in self.calendar_memos if d < self.selected_date]
             if not candidates:
-                messagebox.showinfo("알림", "이전 메모가 없습니다.")
+                self.app.show_status_message("이전 메모가 없습니다.")
                 return
             target = max(candidates)
         else:
             candidates = [d for d in self.calendar_memos if d > self.selected_date]
             if not candidates:
-                messagebox.showinfo("알림", "다음 메모가 없습니다.")
+                self.app.show_status_message("다음 메모가 없습니다.")
                 return
             target = min(candidates)
         self.on_calendar_date_click(target)
 
-    def _refresh_calendar_views(self, redraw_list=True):
+    def _refresh_calendar_views(self, redraw_list=True, changed_dates=None,
+                                moved_month=True, moved_year=True):
         """현재 보이는 달력 뷰만 즉시 다시 그리고, 다른 쪽들은 다음에 그 탭으로
         전환될 때 그리도록 표시만 해둔다(불필요한 위젯 재생성을 피해 반응성을 유지).
         redraw_list=False면 [목록보기]가 보이는 중이어도 목록은 다시 그리지 않음
-        (다른 뷰를 '나중에 그릴 것'으로 표시하는 일은 그대로 함)."""
+        (다른 뷰를 '나중에 그릴 것'으로 표시하는 일은 그대로 함).
+
+        changed_dates=(새로 선택한 날짜, 이전에 선택했던 날짜)를 주면, 보이는 월별/1년전체 그리드가
+        이동하지 않았을 때(moved_month/moved_year가 False) 그 칸들만 다시 그림. 값을 주지 않으면
+        (메모 유무가 바뀐 뒤 debounce로 부르는 경우 등) 예전처럼 그리드 전체를 다시 그림."""
         if self._is_year_view_active():
-            self.render_year_view()
+            if not self._redraw_cells_only(
+                    self.year_grid_frame, changed_dates, moved_year,
+                    getattr(self, "_year_view_stale", False), self._year_rendered_day):
+                self.render_year_view()
             self._month_view_stale = True
             self._list_view_stale = True
         elif self._is_list_view_active():
@@ -2202,22 +2871,51 @@ class CalendarMemoTab:
             self._month_view_stale = True
             self._year_view_stale = True
         else:
-            self.render_month_view()
+            if not self._redraw_cells_only(
+                    self.month_grid_frame, changed_dates, moved_month,
+                    getattr(self, "_month_view_stale", False), self._month_rendered_day):
+                self.render_month_view()
             self._year_view_stale = True
             self._list_view_stale = True
+
+    def _redraw_cells_only(self, grid, changed_dates, moved, stale, rendered_day):
+        """grid(월별/1년전체 그리드 프레임)에서 changed_dates의 칸만 다시 그리고 True를 반환함.
+        부분 갱신이 안전하지 않으면(칸 목록을 주지 않았거나, 보이는 달/해가 바뀌었거나, 갱신이 미뤄져
+        있거나, 마지막으로 그린 뒤 날짜가 바뀌었거나, 새로 선택한 날짜 칸이 이 그리드에 없는 경우)
+        아무것도 하지 않고 False를 반환하므로, 호출한 쪽이 그리드 전체를 다시 그려야 함.
+        changed_dates[0]은 반드시 이 그리드에 있어야 하고, 나머지(이전 선택 날짜 등)는 이 그리드에
+        없으면(다른 달을 보던 중이었음) 건너뜀."""
+        if not changed_dates or moved or stale or rendered_day != self._today_str():
+            return False
+        cells = self._day_cells.get(grid)
+        if not cells or changed_dates[0] not in cells:
+            return False
+        for date_key in dict.fromkeys(changed_dates):  # 순서를 유지한 채 중복 제거
+            if date_key in cells:
+                self._redraw_day_cell(grid, date_key)
+        return True
 
     def save_date_memo_realtime(self, event=None):
         """달력메모 내용을 실시간으로 memos_calendar.json에 저장.
         (내용을 모두 지우면 해당 날짜 항목 자체를 제거해, 메모 표시 점과 파일을 깔끔하게 유지)"""
         if not self.selected_date:
             return
+        if event is not None and getattr(event, "keysym", "") in ("Prior", "Next"):
+            # PageUp/PageDown은 이전/다음 메모 날짜로 이동만 할 뿐 내용도 커서도 바꾸지 않음. 키를 뗄 때
+            # 상태표시줄을 갱신하면 "이전 메모가 없습니다" 같은 알림이 바로 지워지므로 그대로 둠
+            return
         had_memo = self.selected_date in self.calendar_memos
         # 빈 날짜 판정(자동 삭제 여부)에는 .strip()으로 공백만 있는지 보되, 저장하는 값은
         # 원본 그대로 써서 끝줄 공백/빈 줄이 사라지지 않게 함 ("end-1c"는 Tk가 붙이는 마지막
         # 개행 한 글자만 제외함)
         content = self.date_content_text.get("1.0", "end-1c")
-        if content.strip():
-            self.calendar_memos[self.selected_date] = content
+        new_value = content if content.strip() else None  # None = 이 날짜의 메모 없음
+        if new_value == self.calendar_memos.get(self.selected_date):
+            # 방향키/Shift 같은 키는 내용을 바꾸지 않음 - 저장을 예약하지 않고 커서 위치만 갱신
+            self.app.update_status_bar()
+            return
+        if new_value is not None:
+            self.calendar_memos[self.selected_date] = new_value
         else:
             self.calendar_memos.pop(self.selected_date, None)
         self._update_remove_date_memo_button_state()
@@ -2241,10 +2939,16 @@ class CalendarMemoTab:
         버튼이 비활성 상태(이미 내용 없음)면 아무 것도 하지 않음."""
         if str(self.remove_date_memo_button.cget("state")) != tk.NORMAL:
             return "break"
-        if messagebox.askyesno("확인", f"{self.selected_date} 메모 내용을 삭제하시겠습니까?"):
+        if messagebox.askyesno("확인", f"{self.selected_date} 메모 내용을 삭제하시겠습니까?",
+                               parent=self.app.root):
+            # 휴지통에 먼저 넣은 뒤 지움 (MemoApp.trash_add 설명 참고)
+            if not self.app.trash_add("calendar_memo", {"date": self.selected_date,
+                                                        "content": self.calendar_memos.get(self.selected_date, "")}):
+                return "break"  # 휴지통에 보관하지 못했고 사용자가 삭제를 취소함
             self.calendar_memos.pop(self.selected_date, None)
             self.app.save_calendar_memos()
             self.on_calendar_date_click(self.selected_date)
+            self.app.show_status_message("메모를 휴지통으로 옮겼습니다. (복원: Ctrl+Shift+X)")
         return "break"
 
     # ---- 목록보기 ----
@@ -2372,11 +3076,7 @@ class CalendarMemoTab:
         date_spin.icursor(tk.END)
 
         def adjust_date(delta):
-            try:
-                d = datetime.strptime(date_var.get().strip(), "%Y-%m-%d").date()
-            except ValueError:
-                d = date.today()
-            date_var.set((d + timedelta(days=delta)).strftime("%Y-%m-%d"))
+            date_var.set(shift_date_key(date_var.get(), delta, self._today_str()))
 
         # ttk.Spinbox의 기본 클래스 바인딩은 <<Increment>>/<<Decrement>>에서 텍스트를 숫자로
         # 취급해 스스로 증감을 시도하므로(break 없음), 방금 넣은 날짜 문자열을 덮어쓰지 못하게
@@ -2426,6 +3126,8 @@ class CalendarMemoTab:
         self._hide_holiday_tooltip()  # 재구성 전, 떠 있을 수 있는 풍선말 정리
         for widget in self.month_grid_frame.winfo_children():
             widget.destroy()
+        self._day_cells[self.month_grid_frame] = {}
+        self._month_rendered_day = self._today_str()
         self.month_grid_frame.grid_columnconfigure(0, minsize=30)
         for c in range(1, 8):
             self.month_grid_frame.grid_columnconfigure(c, minsize=CAL_CELL_W + 2)
@@ -2482,6 +3184,8 @@ class CalendarMemoTab:
         self._hide_holiday_tooltip()  # 재구성 전, 떠 있을 수 있는 풍선말 정리
         for widget in self.year_grid_frame.winfo_children():
             widget.destroy()
+        self._day_cells[self.year_grid_frame] = {}
+        self._year_rendered_day = self._today_str()
         self.year_grid_frame.grid_columnconfigure(0, minsize=30)
         for c in range(1, 8):
             self.year_grid_frame.grid_columnconfigure(c, minsize=CAL_CELL_W + 2)
@@ -2568,7 +3272,16 @@ class CalendarMemoTab:
         if holiday_name:
             canvas.bind("<Enter>", lambda e, name=holiday_name: self._show_holiday_tooltip(e, name))
             canvas.bind("<Leave>", self._hide_holiday_tooltip)
+        self._day_cells.setdefault(parent, {})[date_key] = (canvas, row, col, day_num, kind)
         return canvas
+
+    def _redraw_day_cell(self, parent, date_key):
+        """parent 그리드에 있는 date_key의 날짜 칸 하나만 지우고 같은 자리에 다시 그림
+        (선택/오늘/메모 있음 표시가 바뀐 칸을 갱신할 때 씀)"""
+        old_canvas, row, col, day_num, kind = self._day_cells[parent][date_key]
+        self._hide_holiday_tooltip()
+        old_canvas.destroy()
+        self._make_day_cell(parent, row, col, day_num, kind, date_key)
 
     def _show_holiday_tooltip(self, event, text):
         """공휴일 날짜 칸에 마우스를 올리면 공휴일 이름을 작은 풍선말로 표시.
@@ -2629,6 +3342,17 @@ class CalendarMemoTab:
             self.go_to_month(self.cal_year, self.cal_month + 1)
         return "break"
 
+    def on_ctrl_shift_h(self, event=None):
+        """Ctrl+Shift+H (고급 사용자용 숨김 기능, 메뉴/버튼/도움말에 없음): holidays.json을 직접 편집하거나
+        GitHub의 파일로 업데이트하는 편집 창을 엶 (이미 열려 있으면 그 창을 앞으로 가져옴)."""
+        HolidayEditorDialog.open_for(self.app, self)
+        return "break"
+
+    def reload_holidays(self):
+        """holidays.json을 다시 읽어 달력(월별/1년전체)과 목록보기에 바로 반영함 (편집 창이 저장한 뒤 호출)"""
+        self.holidays = self.app.store.load_holidays()
+        self._refresh_calendar_views()
+
     def on_ctrl_shift_d(self, event=None):
         """Ctrl+Shift+D (고급 사용자용 숨김 기능, 버튼 없음): 특정 날짜 이전에
         저장된 달력메모를 한꺼번에 삭제하는 팝업. 일반메모는 작성/저장 날짜를
@@ -2654,11 +3378,8 @@ class CalendarMemoTab:
 
         def adjust_date(delta):
             """스핀박스 위/아래 버튼: 날짜를 하루씩 증가/감소 (월/연 경계도 올바르게 처리)"""
-            try:
-                d = datetime.strptime(date_var.get().strip(), "%Y-%m-%d").date()
-            except ValueError:
-                d = date.today() - timedelta(days=1)
-            date_var.set((d + timedelta(days=delta)).strftime("%Y-%m-%d"))
+            yesterday = (date.today() - timedelta(days=1)).strftime("%Y-%m-%d")
+            date_var.set(shift_date_key(date_var.get(), delta, yesterday))
 
         # <<Increment>>/<<Decrement>>의 기본 증감을 "break"로 막는 이유는 [추가] 팝업과 같음
         def on_increment(e=None):
@@ -2683,11 +3404,11 @@ class CalendarMemoTab:
                   justify=tk.LEFT).grid(row=1, column=0, columnspan=2, padx=10, pady=10, sticky="w")
 
         def on_confirm():
-            raw = date_var.get().strip()
-            try:
-                cutoff = datetime.strptime(raw, "%Y-%m-%d").date().strftime("%Y-%m-%d")
-            except ValueError:
-                messagebox.showerror("오류", "날짜를 YYYY-MM-DD 형식으로 입력하세요.", parent=dialog)
+            cutoff = normalize_date_key(date_var.get())
+            if cutoff is None:
+                messagebox.showerror(
+                    "오류", f"날짜를 YYYY-MM-DD 형식({CAL_MIN_YEAR}~{CAL_MAX_YEAR}년)으로 입력하세요.",
+                    parent=dialog)
                 return
             to_delete = [d for d in self.calendar_memos if d <= cutoff]
             backup_path = None
@@ -2695,6 +3416,11 @@ class CalendarMemoTab:
                 proceed, backup_path = self.app.auto_backup_before("before-bulk-delete", parent=dialog)
                 if not proceed:
                     return
+            # 지운 메모마다 휴지통 항목 하나씩 (복원은 휴지통 창에서 여러 개를 한꺼번에 고를 수 있음)
+            if not self.app.trash_add_many(
+                    [("calendar_memo", {"date": d, "content": self.calendar_memos[d]}, {})
+                     for d in sorted(to_delete)], parent=dialog):
+                return  # 휴지통에 보관하지 못했고 사용자가 삭제를 취소함 (대화상자는 그대로 둠)
             for d in to_delete:
                 del self.calendar_memos[d]
             self.app.save_calendar_memos()
@@ -2703,9 +3429,11 @@ class CalendarMemoTab:
             dialog.destroy()
             if to_delete:
                 messagebox.showinfo(
-                    "완료", f"{len(to_delete)}개의 달력메모를 삭제했습니다." + self.app.backup_note(backup_path))
+                    "완료", f"{len(to_delete)}개의 달력메모를 삭제했습니다.\n휴지통(Ctrl+Shift+X)에서 복원할 수 있습니다."
+                    + self.app.backup_note(backup_path),
+                    parent=self.app.root)
             else:
-                messagebox.showinfo("완료", "삭제할 메모가 없습니다.")
+                messagebox.showinfo("완료", "삭제할 메모가 없습니다.", parent=self.app.root)
 
         def on_cancel():
             dialog.destroy()
@@ -2738,7 +3466,7 @@ class CalendarMemoTab:
 
     def transfer_apply(self, data):
         self.calendar_memos = data
-        ok = self.app.save_calendar_memos()
+        ok = self.app.save_calendar_memos(notify=False)  # 실패는 호출한 쪽이 직접 안내함
         set_text_content(self.date_content_text, self.calendar_memos.get(self.selected_date, ""))
         self._update_remove_date_memo_button_state()
         self.render_month_view()
@@ -2750,6 +3478,32 @@ class CalendarMemoTab:
         self.app.update_status_bar()
         return ok
 
+    def transfer_merge(self, incoming):
+        """가져온 메모(transfer_parse 결과)를 날짜별로 더함: 그 날짜가 비어 있으면 그대로 추가하고,
+        이미 메모가 있으면 덮어쓰지 않고 기존 내용 아래에 빈 줄을 두고 이어 붙임. 같은 내용이 이미
+        들어 있으면(text_has_block) 건너뜀. 화면/데이터는 건드리지 않고 (합친 dict, 보고서)를 반환함"""
+        merged = dict(self.calendar_memos)
+        added = appended = skipped = 0
+        for date_key in sorted(incoming):
+            content = incoming[date_key]
+            existing = merged.get(date_key, "")
+            if not content.strip():
+                skipped += 1
+            elif not existing.strip():
+                merged[date_key] = content
+                added += 1
+            elif text_has_block(existing, content):
+                skipped += 1
+            else:
+                merged[date_key] = f"{existing.rstrip()}\n\n{content.strip(chr(10))}"
+                appended += 1
+        lines = [f"새로 추가: 날짜 {added}개"]
+        if appended:
+            lines.append(f"이미 메모가 있는 날짜라 기존 내용 아래에 이어 붙임: {appended}개")
+        if skipped:
+            lines.append(f"이미 같은 내용이 있어 건너뜀: 날짜 {skipped}개")
+        return merged, {"changes": added + appended, "lines": lines}
+
     def transfer_export_json(self):
         return dict(sorted(self.calendar_memos.items()))  # 날짜 오름차순
 
@@ -2760,6 +3514,81 @@ class CalendarMemoTab:
 
     def transfer_export_xlsx(self):
         return "달력메모", ["날짜", "내용"], [[k, v] for k, v in sorted(self.calendar_memos.items())]
+
+    # ---- 통합검색 (검색 탭이 호출함 - 파일 위 "앱 구조 안내" 참고) ----
+
+    search_key = "calendar"
+    search_icon = "📅"
+    search_label = "달력메모"
+
+    @staticmethod
+    def _search_date_label(date_key):
+        """결과 목록의 "위치" 칸에 보여줄 "2026-10-19 (월)" 형태의 날짜"""
+        try:
+            weekday = ["월", "화", "수", "목", "금", "토", "일"][datetime.strptime(date_key, "%Y-%m-%d").weekday()]
+            return f"{date_key} ({weekday})"
+        except ValueError:
+            return date_key
+
+    def search_matches(self, terms):
+        """날짜("2026-10-19")와 내용에 terms의 단어가 모두 들어 있는 메모를 날짜순으로 찾음.
+        (날짜도 대상이라 "2026-10" 같은 검색어로 그 달의 메모를 모아 볼 수 있음)"""
+        results = []
+        for date_key in sorted(self.calendar_memos):
+            content = self.calendar_memos[date_key]
+            if not text_matches_terms(f"{date_key}\n{content}".lower(), terms):
+                continue
+            results.append({
+                "where": self._search_date_label(date_key),
+                "text": make_search_snippet(content, terms),
+                "target": {"date": date_key, "term": first_matching_term(content, terms)},
+            })
+        return results
+
+    def goto_search_result(self, target):
+        """그 날짜를 선택하고(달력도 그 달/해로 이동) 내용 편집창의 커서를 일치한 곳에 둠.
+        그 사이 메모가 지워졌다면 False"""
+        date_key = target["date"]
+        if date_key not in self.calendar_memos:
+            return False
+        self.on_calendar_date_click(date_key)
+        place_cursor_at_term(self.date_content_text, target["term"])
+        self.date_content_text.focus_set()
+        self.app.update_status_bar()
+        return True
+
+    # ---- 휴지통 (MemoApp.restore_from_trash가 호출함 - 파일 위 "앱 구조 안내" 참고) ----
+
+    trash_kinds = ("calendar_memo",)
+
+    def trash_describe(self, entry):
+        """휴지통 창에 보여줄 위치/내용 요약/전체 내용"""
+        content = str(entry["data"].get("content", ""))
+        return {"where": self._search_date_label(str(entry["data"].get("date", ""))),
+                "text": make_search_snippet(content, []), "detail": content}
+
+    def trash_restore(self, entry):
+        """지운 메모를 그 날짜로 되돌림. 그 날짜에 새로 쓴 메모가 있으면 덮어쓰지 않고 그 아래에 이어 붙임
+        (같은 날짜가 겹칠 때 내용을 합치는 normalize_calendar_memos와 같은 방식)"""
+        date_key = normalize_date_key(entry["data"].get("date"))
+        content = entry["data"].get("content")
+        if date_key is None or not isinstance(content, str):
+            raise ValueError("날짜나 내용이 올바르지 않아 복원할 수 없습니다.")
+        existing = self.calendar_memos.get(date_key, "")
+        if not existing.strip():
+            self.calendar_memos[date_key] = content
+            return "", {"date": date_key}
+        if existing == content:
+            return f"{date_key}에는 같은 내용의 메모가 이미 있습니다.", {"date": date_key}
+        self.calendar_memos[date_key] = f"{existing}\n\n{content}"
+        return f"{date_key}에는 이미 메모가 있어 기존 내용 아래에 이어 붙였습니다.", {"date": date_key}
+
+    def trash_finish_restore(self, targets):
+        """복원이 끝난 뒤 저장하고, 마지막으로 복원한 날짜를 선택해 달력/편집창에 보여줌"""
+        ok = self.app.save_calendar_memos()
+        self._refresh_calendar_views()
+        self.on_calendar_date_click(targets[-1]["date"])
+        return ok
 
 
 # ============================================================================
@@ -3385,9 +4214,7 @@ class ChecklistTab:
         items_container.rowconfigure(0, weight=1)
         items_container.columnconfigure(0, weight=1)
 
-        style = ttk.Style()
-        style.configure("Checklist.Treeview", font=self._content_font,
-                         rowheight=max(24, int(self._content_font[1] * 2.4)))
+        # Checklist.Treeview 스타일(글꼴/행 높이)은 apply_custom_styles()가 정의함
 
         self.items_tree = ttk.Treeview(
             items_container, columns=("status", "content"),
@@ -3412,6 +4239,9 @@ class ChecklistTab:
         copy_bar.pack(side=tk.BOTTOM, fill=tk.X, pady=5, before=items_container)
         self.copy_button = ttk.Button(copy_bar, text="클립보드로 복사", command=self.app.copy_to_clipboard)
         self.copy_button.pack(side=tk.RIGHT)
+        # [🗑]는 [클립보드로 복사]의 오른쪽에 둠: RIGHT로 먼저 놓인 위젯이 더 오른쪽이므로 before=로
+        # 복사 버튼보다 앞서 배치함 (Tab 이동 순서는 복사 → 휴지통으로 유지됨)
+        make_trash_button(copy_bar, self.app).pack(side=tk.RIGHT, before=self.copy_button, padx=(6, 0))
         self.copy_status_label = ttk.Label(copy_bar, text="", font=("맑은 고딕", 11, "bold"))
         self.copy_status_label.pack(side=tk.RIGHT, padx=(0, 10))
         self.copy_button.state(["disabled"])  # 선택한 항목이 없는 상태로 시작
@@ -3490,8 +4320,16 @@ class ChecklistTab:
             self.app.save_checklists()
 
     def _delete_folder_data(self, fid):
+        """폴더를 지움. 휴지통에 보관하지 못하고 사용자가 삭제를 취소하면 지우지 않고 False를 반환함"""
+        for index, folder in enumerate(self.data["folders"]):
+            if folder["id"] == fid:
+                # 휴지통에 먼저 넣은 뒤 지움 (MemoApp.trash_add 설명 참고). 항목은 폴더 안에 담긴 채로 들어감
+                if not self.app.trash_add("checklist_folder", folder, {"index": index}):
+                    return False
+                break
         self.data["folders"] = [f for f in self.data["folders"] if f["id"] != fid]
         self.app.save_checklists()
+        return True
 
     def _reorder_folders_data(self, ordered_ids):
         lookup = {f["id"]: f for f in self.data["folders"]}
@@ -3526,11 +4364,20 @@ class ChecklistTab:
                 return
 
     def _delete_item_data(self, fid, item_id):
+        """항목을 지움. 휴지통에 보관하지 못하고 사용자가 삭제를 취소하면 지우지 않고 False를 반환함"""
         folder = self._get_folder(fid)
         if not folder:
-            return
+            return False
+        for index, item in enumerate(folder["items"]):
+            if item["id"] == item_id:
+                # 휴지통에 먼저 넣은 뒤 지움. 어느 폴더의 몇 번째였는지(origin)를 함께 남김
+                if not self.app.trash_add("checklist_item", item, {
+                        "parent_id": fid, "parent_name": folder["name"], "index": index}):
+                    return False
+                break
         folder["items"] = [i for i in folder["items"] if i["id"] != item_id]
         self.app.save_checklists()
+        return True
 
     def _reorder_items_data(self, fid, ordered_ids):
         folder = self._get_folder(fid)
@@ -3552,9 +4399,7 @@ class ChecklistTab:
     # ==================== MemoApp이 공통으로 호출하는 인터페이스 ====================
 
     def set_content_font(self, font_tuple):
-        self._content_font = font_tuple
-        style = ttk.Style()
-        style.configure("Checklist.Treeview", font=font_tuple, rowheight=max(24, int(font_tuple[1] * 2.4)))
+        self._content_font = font_tuple  # 목록 글꼴/행 높이 스타일은 SettingsManager가 apply_custom_styles()로 설정
 
     def apply_theme_colors(self, colors):
         self._current_colors = colors
@@ -3778,9 +4623,9 @@ class ChecklistTab:
             f"'{folder['name']}' 폴더와 포함된 항목 {count}개가 모두 삭제됩니다.\n계속하시겠습니까?",
             parent=self.app.root,
         ):
-            self._delete_folder_data(fid)
-            self._refresh_folders()
-            self.app.show_status_message("폴더를 삭제했습니다.")
+            if self._delete_folder_data(fid):
+                self._refresh_folders()
+                self.app.show_status_message("폴더를 휴지통으로 옮겼습니다. (복원: Ctrl+Shift+X)")
 
     def _move_folder(self, direction):
         fid = self._get_selected_folder_id()
@@ -3914,11 +4759,11 @@ class ChecklistTab:
         if not fid or not item_id:
             return
         if messagebox.askyesno("항목 삭제", "선택한 항목을 삭제하시겠습니까?", parent=self.app.root):
-            self._delete_item_data(fid, item_id)
-            # 폴더 목록 전체가 아니라 그 폴더의 항목 수 (N)와 오른쪽 항목 목록만 갱신함
-            self._update_folder_label(fid)
-            self._refresh_items()
-            self.app.show_status_message("항목을 삭제했습니다.")
+            if self._delete_item_data(fid, item_id):
+                # 폴더 목록 전체가 아니라 그 폴더의 항목 수 (N)와 오른쪽 항목 목록만 갱신함
+                self._update_folder_label(fid)
+                self._refresh_items()
+                self.app.show_status_message("항목을 휴지통으로 옮겼습니다. (복원: Ctrl+Shift+X)")
 
     def _show_context_menu(self, event):
         row_id = self.items_tree.identify_row(event.y)
@@ -4156,9 +5001,21 @@ class ChecklistTab:
         # 편집 중이던 인라인 편집은 곧 사라질 이전 데이터에 대한 것이므로 커밋하지 않고 버림
         self._cancel_inline_edit()
         self.data = data
-        ok = self.app.save_checklists()
+        ok = self.app.save_checklists(notify=False)  # 실패는 호출한 쪽이 직접 안내함
         self._refresh_folders()
         return ok
+
+    def transfer_merge(self, incoming):
+        """가져온 폴더(transfer_parse 결과)를 기존 폴더에 더함. 규칙은 파일 위 "병합 가져오기" 주석과
+        merge_parent_lists 참고 (폴더는 id 또는 이름이 같으면 합치고, 항목은 id가 같고 내용도 같거나
+        같은 폴더에 같은 내용이 있으면 건너뜀). 화면/데이터는 건드리지 않고 ({"folders": ...}, 보고서)를 반환함"""
+        folders, stats = merge_parent_lists(
+            self.data["folders"], incoming["folders"], ("content", "checked", "added"),
+            item_key=lambda item: item["content"].strip(),
+            item_same=lambda a, b: a["content"].strip() == b["content"].strip())
+        return ({"folders": folders},
+                {"changes": stats["new_parents"] + stats["added"] + stats["conflicts"],
+                 "lines": merge_report_lines(stats, "폴더")})
 
     def transfer_export_json(self):
         return self.data
@@ -4179,6 +5036,106 @@ class ChecklistTab:
             for it in folder["items"]:
                 rows.append([folder["name"], "완료" if it.get("checked") else "미완료", it.get("content", "")])
         return "체크리스트", ["폴더", "상태", "내용"], rows
+
+    # ---- 통합검색 (검색 탭이 호출함 - 파일 위 "앱 구조 안내" 참고) ----
+
+    search_key = "checklist"
+    search_icon = "✅"
+    search_label = "체크리스트"
+
+    def search_matches(self, terms):
+        """폴더 이름과 항목 내용에서 terms의 단어가 모두 들어 있는 것을 찾음 (폴더 → 그 폴더의 항목 순)"""
+        results = []
+        for folder in self.data["folders"]:
+            name = folder["name"]
+            if text_matches_terms(name.lower(), terms):
+                results.append({"where": name, "text": "(폴더)",
+                                "target": {"folder_id": folder["id"], "item_id": None}})
+            for item in folder["items"]:
+                content = item.get("content", "")
+                if text_matches_terms(content.lower(), terms):
+                    mark = "☑" if item.get("checked") else "☐"
+                    results.append({"where": name, "text": f"{mark} {make_search_snippet(content, terms)}",
+                                    "target": {"folder_id": folder["id"], "item_id": item["id"]}})
+        return results
+
+    def goto_search_result(self, target):
+        """그 폴더(와 항목)를 선택하고 항목 목록(폴더 결과면 폴더 목록)에 포커스를 줌.
+        폴더나 항목이 그 사이 지워졌다면 False"""
+        folder_id, item_id = target["folder_id"], target["item_id"]
+        if not self._get_folder(folder_id) or (item_id and not self._find_item(folder_id, item_id)):
+            return False
+        self._refresh_folders(select_id=folder_id, select_item_id=item_id)
+        (self.items_tree if item_id else self.folder_listbox).focus_set()
+        return True
+
+    # ---- 휴지통 (MemoApp.restore_from_trash가 호출함 - 파일 위 "앱 구조 안내" 참고) ----
+
+    trash_kinds = ("checklist_item", "checklist_folder")
+
+    def trash_describe(self, entry):
+        """휴지통 창에 보여줄 위치/내용 요약/전체 내용"""
+        data, origin = entry["data"], entry["origin"]
+        if entry["kind"] == "checklist_item":
+            content = str(data.get("content", ""))
+            mark = "☑" if data.get("checked") else "☐"
+            parent = str(origin.get("parent_name") or "")
+            return {"where": parent or "(폴더 정보 없음)", "text": f"{mark} {make_search_snippet(content, [])}",
+                    "detail": f"{mark} {content}\n\n폴더: {parent}"}
+        items = [i for i in data.get("items", []) if isinstance(i, dict)]
+        lines = [f"{'☑' if i.get('checked') else '☐'} {i.get('content', '')}" for i in items[:100]]
+        if len(items) > 100:
+            lines.append(f"… 외 {len(items) - 100}개")
+        return {"where": str(data.get("name", "")), "text": f"(폴더 · 항목 {len(items)}개)",
+                "detail": f"폴더: {data.get('name', '')}\n\n" + "\n".join(lines)}
+
+    def trash_restore(self, entry):
+        """지운 항목/폴더를 되돌림. (안내 문구, 이동 대상)을 반환함. 화면/저장은 trash_finish_restore가 처리함.
+          - 항목: 원래 폴더의 원래 자리로. 그 폴더가 그 사이 지워졌으면 같은 id/이름으로 새로 만들어 그 안에 넣음
+          - 폴더: 원래 자리로 안의 항목까지. 같은 폴더가 이미 있으면(위처럼 새로 만들어진 경우) 항목만 합침
+          - 항목 id가 지금 있는 항목과 겹치면 새 id를 받음"""
+        data, origin = entry["data"], entry["origin"]
+        seen = {item["id"] for folder in self.data["folders"] for item in folder["items"]}
+
+        def clean(raw):
+            if not isinstance(raw, dict):
+                return None
+            return {"id": unique_id(raw.get("id"), seen), "content": str(raw.get("content", "")),
+                    "checked": bool(raw.get("checked", False)), "added": str(raw.get("added", ""))}
+
+        if entry["kind"] == "checklist_item":
+            item = clean(data)
+            if item is None or not item["content"]:
+                raise ValueError("항목 내용이 올바르지 않아 복원할 수 없습니다.")
+            note = ""
+            folder = self._get_folder(origin.get("parent_id"))
+            if folder is None:
+                name = str(origin.get("parent_name") or "복원된 항목")
+                folder = {"id": str(origin.get("parent_id") or short_id()), "name": name,
+                          "created": now_iso(), "items": []}
+                self.data["folders"].append(folder)
+                note = f"폴더 '{name}'이(가) 없어 새로 만들어 복원했습니다."
+            folder["items"].insert(clamp_index(origin.get("index"), len(folder["items"])), item)
+            return note, {"folder_id": folder["id"], "item_id": item["id"]}
+
+        items = [i for i in (clean(raw) for raw in (data.get("items") if isinstance(data.get("items"), list) else []))
+                 if i is not None]
+        existing = self._get_folder(str(data.get("id") or ""))
+        if existing is not None:
+            existing["items"].extend(items)
+            return (f"'{existing['name']}' 폴더가 이미 있어 항목 {len(items)}개를 그 폴더에 합쳤습니다.",
+                    {"folder_id": existing["id"], "item_id": None})
+        folder = {"id": str(data.get("id") or short_id()), "name": str(data.get("name") or "이름 없음"),
+                  "created": str(data.get("created") or now_iso()), "items": items}
+        self.data["folders"].insert(clamp_index(origin.get("index"), len(self.data["folders"])), folder)
+        return "", {"folder_id": folder["id"], "item_id": None}
+
+    def trash_finish_restore(self, targets):
+        """복원이 끝난 뒤 저장하고, 마지막으로 복원한 폴더/항목을 선택해 보여줌"""
+        ok = self.app.save_checklists()
+        last = targets[-1]
+        self._refresh_folders(select_id=last["folder_id"], select_item_id=last["item_id"])
+        return ok
 
 
 class CollectionTab:
@@ -4206,7 +5163,17 @@ class CollectionTab:
     # 기능이 없어, 이모지 한 글자 정도의 폭을 어림잡은 값임
     LINK_ICON_ZONE_WIDTH = 26
 
-    _URL_LIKE_RE = re.compile(r"^[\w.\-]+\.[a-zA-Z]{2,}(/\S*)?$")
+    # 스킴(http://)이나 www. 없이 입력한 \"도메인 모양\" 글자: 호스트 + 최상위 도메인 + (포트) + (경로)
+    _URL_LIKE_RE = re.compile(r"^(?:[\w\-]+\.)+(?P<tld>[a-zA-Z]{2,})(?::\d{1,5})?(?:[/?#]\S*)?$")
+    # 스킴·www. 없이 입력한 글자를 URL로 인정하는 최상위 도메인. Node.js, ad.py, config.json,
+    # readme.md, mr.kim 처럼 파일명·제품명·이름이 URL로 오인되어 글자가 https://...로 바뀌고
+    # 엉뚱한 도메인으로 제목 가져오기 요청이 나가는 것을 막기 위해 일반적인 주소 도메인만 허용함.
+    # (http://, https://, www.로 시작하면 이 목록과 상관없이 항상 URL로 봄)
+    _BARE_DOMAIN_TLDS = frozenset({
+        "com", "net", "org", "edu", "gov", "mil", "info", "biz", "kr", "jp", "cn", "tw", "hk",
+        "us", "uk", "de", "fr", "es", "ca", "au", "nz", "ru", "io", "ai", "dev", "app", "me",
+        "tv", "co", "xyz", "site", "online", "shop", "blog", "cloud", "tech",
+    })
 
     def __init__(self, parent, app):
         self.app = app
@@ -4289,9 +5256,7 @@ class CollectionTab:
         items_container.rowconfigure(0, weight=1)
         items_container.columnconfigure(0, weight=1)
 
-        style = ttk.Style()
-        style.configure("Collection.Treeview", font=self._content_font,
-                         rowheight=max(24, int(self._content_font[1] * 2.4)))
+        # Collection.Treeview 스타일(글꼴/행 높이)은 apply_custom_styles()가 정의함
 
         self.items_tree = ttk.Treeview(
             items_container, columns=("title", "url", "memo"),
@@ -4317,6 +5282,9 @@ class CollectionTab:
         copy_bar.pack(side=tk.BOTTOM, fill=tk.X, pady=5, before=items_container)
         self.copy_button = ttk.Button(copy_bar, text="클립보드로 복사", command=self.app.copy_to_clipboard)
         self.copy_button.pack(side=tk.RIGHT)
+        # [🗑]는 [클립보드로 복사]의 오른쪽에 둠: RIGHT로 먼저 놓인 위젯이 더 오른쪽이므로 before=로
+        # 복사 버튼보다 앞서 배치함 (Tab 이동 순서는 복사 → 휴지통으로 유지됨)
+        make_trash_button(copy_bar, self.app).pack(side=tk.RIGHT, before=self.copy_button, padx=(6, 0))
         self.copy_status_label = ttk.Label(copy_bar, text="", font=("맑은 고딕", 11, "bold"))
         self.copy_status_label.pack(side=tk.RIGHT, padx=(0, 10))
         self.copy_button.state(["disabled"])  # 선택한 항목이 없는 상태로 시작
@@ -4407,8 +5375,16 @@ class CollectionTab:
             self.app.save_collections()
 
     def _delete_collection_data(self, cid):
+        """컬렉션을 지움. 휴지통에 보관하지 못하고 사용자가 삭제를 취소하면 지우지 않고 False를 반환함"""
+        for index, col in enumerate(self.data["collections"]):
+            if col["id"] == cid:
+                # 휴지통에 먼저 넣은 뒤 지움 (MemoApp.trash_add 설명 참고). 항목은 컬렉션 안에 담긴 채로 들어감
+                if not self.app.trash_add("collection", col, {"index": index}):
+                    return False
+                break
         self.data["collections"] = [c for c in self.data["collections"] if c["id"] != cid]
         self.app.save_collections()
+        return True
 
     def _reorder_collections_data(self, ordered_ids):
         lookup = {c["id"]: c for c in self.data["collections"]}
@@ -4452,11 +5428,20 @@ class CollectionTab:
                 return
 
     def _delete_item_data(self, cid, item_id):
+        """항목을 지움. 휴지통에 보관하지 못하고 사용자가 삭제를 취소하면 지우지 않고 False를 반환함"""
         col = self._get_collection(cid)
         if not col:
-            return
+            return False
+        for index, item in enumerate(col["items"]):
+            if item["id"] == item_id:
+                # 휴지통에 먼저 넣은 뒤 지움. 어느 컬렉션의 몇 번째였는지(origin)를 함께 남김
+                if not self.app.trash_add("collection_item", item, {
+                        "parent_id": cid, "parent_name": col["name"], "index": index}):
+                    return False
+                break
         col["items"] = [i for i in col["items"] if i["id"] != item_id]
         self.app.save_collections()
+        return True
 
     def _reorder_items_data(self, cid, ordered_ids):
         col = self._get_collection(cid)
@@ -4478,9 +5463,7 @@ class CollectionTab:
     # ---- MemoApp이 공통으로 호출하는 인터페이스 ----
 
     def set_content_font(self, font_tuple):
-        self._content_font = font_tuple
-        style = ttk.Style()
-        style.configure("Collection.Treeview", font=font_tuple, rowheight=max(24, int(font_tuple[1] * 2.4)))
+        self._content_font = font_tuple  # 목록 글꼴/행 높이 스타일은 SettingsManager가 apply_custom_styles()로 설정
 
     def apply_theme_colors(self, colors):
         self._current_colors = colors
@@ -4647,7 +5630,8 @@ class CollectionTab:
         lowered = text.lower()
         if lowered.startswith(("http://", "https://", "www.")):
             return True
-        return bool(self._URL_LIKE_RE.match(text))
+        match = self._URL_LIKE_RE.match(text)
+        return bool(match and match.group("tld").lower() in self._BARE_DOMAIN_TLDS)
 
     def _on_add_submit(self, event=None):
         raw = self.add_entry.get().strip()
@@ -4714,7 +5698,11 @@ class CollectionTab:
                 item = self._find_item(cid, request_id)
                 if item is None:
                     continue
-                if msg.get("title"):
+                if msg.get("title") and item.get("title") != item.get("url"):
+                    # 항목을 추가할 때의 제목은 URL 자체임. 가져오는 동안 제목을 직접 고쳤거나 URL을
+                    # 바꿨다면(제목 != URL) 사용자의 편집을 가져온 제목으로 덮어쓰지 않음
+                    self.app.show_status_message("제목을 직접 수정한 항목이라 가져온 제목은 적용하지 않았습니다.")
+                elif msg.get("title"):
                     self._update_item_data(cid, request_id, title=msg["title"])
                     # 목록 전체를 다시 그리면 보고 있던 항목의 선택이 풀리고, 편집 중이던
                     # 인라인 편집이 강제로 확정되므로 그 항목의 행만 갱신함
@@ -4821,9 +5809,9 @@ class CollectionTab:
             f"'{col['name']}' 컬렉션과 포함된 항목 {count}개가 모두 삭제됩니다.\n계속하시겠습니까?",
             parent=self.app.root,
         ):
-            self._delete_collection_data(cid)
-            self._refresh_collections()
-            self.app.show_status_message("컬렉션을 삭제했습니다.")
+            if self._delete_collection_data(cid):
+                self._refresh_collections()
+                self.app.show_status_message("컬렉션을 휴지통으로 옮겼습니다. (복원: Ctrl+Shift+X)")
 
     def _move_collection(self, direction):
         cid = self._get_selected_collection_id()
@@ -5060,11 +6048,11 @@ class CollectionTab:
         if not cid or not item_id:
             return
         if messagebox.askyesno("항목 삭제", "선택한 항목을 삭제하시겠습니까?", parent=self.app.root):
-            self._delete_item_data(cid, item_id)
-            # 컬렉션 목록 전체가 아니라 그 컬렉션의 항목 수 (N)와 오른쪽 항목 목록만 갱신함
-            self._update_collection_label(cid)
-            self._refresh_items()
-            self.app.show_status_message("항목을 삭제했습니다.")
+            if self._delete_item_data(cid, item_id):
+                # 컬렉션 목록 전체가 아니라 그 컬렉션의 항목 수 (N)와 오른쪽 항목 목록만 갱신함
+                self._update_collection_label(cid)
+                self._refresh_items()
+                self.app.show_status_message("항목을 휴지통으로 옮겼습니다. (복원: Ctrl+Shift+X)")
 
     def _show_context_menu(self, event):
         iid = self.items_tree.identify_row(event.y)
@@ -5310,9 +6298,28 @@ class CollectionTab:
         # 편집 중이던 인라인 편집은 곧 사라질 이전 데이터에 대한 것이므로 커밋하지 않고 버림
         self._cancel_inline_edit()
         self.data = data
-        ok = self.app.save_collections()
+        ok = self.app.save_collections(notify=False)  # 실패는 호출한 쪽이 직접 안내함
         self._refresh_collections()
         return ok
+
+    def transfer_merge(self, incoming):
+        """가져온 컬렉션(transfer_parse 결과)을 기존 컬렉션에 더함. 규칙은 체크리스트 탭과 같고
+        (merge_parent_lists), 같은 컬렉션 안에서 "같은 항목"은 URL이 같은 것(주소 끝의 /나 대소문자
+        차이는 무시, URL이 없으면 제목+메모가 같은 것)임. 화면/데이터는 건드리지 않고
+        ({"collections": ...}, 보고서)를 반환함"""
+        def key(item):
+            url_key = normalize_url_key(item["url"])
+            return ("url", url_key) if url_key else ("text", item["title"].strip(), item["memo"].strip())
+
+        def same(a, b):
+            return all(a[f].strip() == b[f].strip() for f in ("title", "url", "memo"))
+
+        collections, stats = merge_parent_lists(
+            self.data["collections"], incoming["collections"], ("title", "url", "memo", "added"),
+            item_key=key, item_same=same)
+        return ({"collections": collections},
+                {"changes": stats["new_parents"] + stats["added"] + stats["conflicts"],
+                 "lines": merge_report_lines(stats, "컬렉션")})
 
     def transfer_export_json(self):
         return self.data
@@ -5335,11 +6342,936 @@ class CollectionTab:
                 for col in self.data["collections"] for it in col["items"]]
         return "컬렉션", ["컬렉션", "제목", "URL", "메모"], rows
 
+    # ---- 통합검색 (검색 탭이 호출함 - 파일 위 "앱 구조 안내" 참고) ----
+
+    search_key = "collection"
+    search_icon = "📚"
+    search_label = "컬렉션"
+
+    def search_matches(self, terms):
+        """컬렉션 이름과 항목의 제목/메모/URL에서 terms의 단어가 모두 들어 있는 것을 찾음
+        (컬렉션 → 그 컬렉션의 항목 순)"""
+        results = []
+        for col in self.data["collections"]:
+            name = col["name"]
+            if text_matches_terms(name.lower(), terms):
+                results.append({"where": name, "text": "(컬렉션)",
+                                "target": {"collection_id": col["id"], "item_id": None}})
+            for item in col["items"]:
+                line = " | ".join(part for part in (str(item.get("title") or ""),
+                                                    str(item.get("memo") or ""),
+                                                    str(item.get("url") or "")) if part)
+                if text_matches_terms(line.lower(), terms):
+                    results.append({"where": name, "text": make_search_snippet(line, terms),
+                                    "target": {"collection_id": col["id"], "item_id": item["id"]}})
+        return results
+
+    def goto_search_result(self, target):
+        """그 컬렉션(과 항목)을 선택하고 항목 목록(컬렉션 결과면 컬렉션 목록)에 포커스를 줌.
+        컬렉션이나 항목이 그 사이 지워졌다면 False"""
+        collection_id, item_id = target["collection_id"], target["item_id"]
+        if not self._get_collection(collection_id) or (item_id and not self._find_item(collection_id, item_id)):
+            return False
+        self._refresh_collections(select_id=collection_id, select_item_id=item_id)
+        (self.items_tree if item_id else self.collection_listbox).focus_set()
+        return True
+
+    # ---- 휴지통 (MemoApp.restore_from_trash가 호출함 - 파일 위 "앱 구조 안내" 참고) ----
+
+    trash_kinds = ("collection_item", "collection")
+
+    def trash_describe(self, entry):
+        """휴지통 창에 보여줄 위치/내용 요약/전체 내용"""
+        data, origin = entry["data"], entry["origin"]
+        if entry["kind"] == "collection_item":
+            title, url, memo = (str(data.get(k, "")) for k in ("title", "url", "memo"))
+            line = " | ".join(part for part in (title, memo, url) if part)
+            return {"where": str(origin.get("parent_name") or "(컬렉션 정보 없음)"),
+                    "text": make_search_snippet(line, []),
+                    "detail": f"제목: {title}\nURL: {url}\n메모: {memo}\n\n컬렉션: {origin.get('parent_name') or ''}"}
+        items = [i for i in data.get("items", []) if isinstance(i, dict)]
+        lines = [str(i.get("title") or i.get("url") or i.get("memo") or "") for i in items[:100]]
+        if len(items) > 100:
+            lines.append(f"… 외 {len(items) - 100}개")
+        return {"where": str(data.get("name", "")), "text": f"(컬렉션 · 항목 {len(items)}개)",
+                "detail": f"컬렉션: {data.get('name', '')}\n\n" + "\n".join(lines)}
+
+    def trash_restore(self, entry):
+        """지운 항목/컬렉션을 되돌림. (안내 문구, 이동 대상)을 반환함. 화면/저장은 trash_finish_restore가 처리함.
+        규칙은 체크리스트 탭의 trash_restore와 같음 (원래 자리로 / 부모가 없으면 새로 만듦 / 같은 컬렉션이
+        있으면 항목만 합침 / 항목 id가 겹치면 새 id)"""
+        data, origin = entry["data"], entry["origin"]
+        seen = {item["id"] for col in self.data["collections"] for item in col["items"]}
+
+        def clean(raw):
+            if not isinstance(raw, dict):
+                return None
+            return {"id": unique_id(raw.get("id"), seen), "title": str(raw.get("title", "")),
+                    "url": str(raw.get("url", "")), "memo": str(raw.get("memo", "")),
+                    "added": str(raw.get("added", ""))}
+
+        if entry["kind"] == "collection_item":
+            item = clean(data)
+            if item is None or not (item["title"] or item["url"] or item["memo"]):
+                raise ValueError("항목 내용이 올바르지 않아 복원할 수 없습니다.")
+            note = ""
+            col = self._get_collection(origin.get("parent_id"))
+            if col is None:
+                name = str(origin.get("parent_name") or "복원된 항목")
+                col = {"id": str(origin.get("parent_id") or short_id()), "name": name,
+                       "created": now_iso(), "items": []}
+                self.data["collections"].append(col)
+                note = f"컬렉션 '{name}'이(가) 없어 새로 만들어 복원했습니다."
+            col["items"].insert(clamp_index(origin.get("index"), len(col["items"])), item)
+            return note, {"collection_id": col["id"], "item_id": item["id"]}
+
+        items = [i for i in (clean(raw) for raw in (data.get("items") if isinstance(data.get("items"), list) else []))
+                 if i is not None]
+        existing = self._get_collection(str(data.get("id") or ""))
+        if existing is not None:
+            existing["items"].extend(items)
+            return (f"'{existing['name']}' 컬렉션이 이미 있어 항목 {len(items)}개를 그 컬렉션에 합쳤습니다.",
+                    {"collection_id": existing["id"], "item_id": None})
+        col = {"id": str(data.get("id") or short_id()), "name": str(data.get("name") or "이름 없음"),
+               "created": str(data.get("created") or now_iso()), "items": items}
+        self.data["collections"].insert(clamp_index(origin.get("index"), len(self.data["collections"])), col)
+        return "", {"collection_id": col["id"], "item_id": None}
+
+    def trash_finish_restore(self, targets):
+        """복원이 끝난 뒤 저장하고, 마지막으로 복원한 컬렉션/항목을 선택해 보여줌"""
+        ok = self.app.save_collections()
+        last = targets[-1]
+        self._refresh_collections(select_id=last["collection_id"], select_item_id=last["item_id"])
+        return ok
+
+
+# ============================================================================
+# "검색" 탭 (통합검색)
+# ============================================================================
+
+class SearchTab:
+    """"검색" 탭: 검색어를 입력하면 체크한 탭들의 데이터를 한꺼번에 검색해 결과 목록으로 보여주고,
+    결과를 열면(더블클릭/Enter) 그 결과가 속한 탭으로 전환해 해당 항목으로 이동함.
+
+      - 검색 대상은 생성자에 넘긴 sources(각 탭)임. 각 탭이 자기 데이터를 검색하는 방법
+        (search_matches)과 결과로 이동하는 방법(goto_search_result)을 알고 있고, 이 클래스는
+        탭 내부 구조를 모름. 대상 탭을 늘리려면 그 탭에 search_* 항목(파일 위 "앱 구조 안내"
+        참고)을 구현하고 MemoApp에서 sources에 넣으면 체크박스도 자동으로 생김.
+      - 검색어는 공백으로 나눈 단어가 모두 들어 있는 항목을 찾음 (대소문자 구분 없음).
+      - 결과 목록은 검색한 시점의 스냅샷임. 검색 뒤에 데이터가 바뀌어도 목록을 자동으로 다시
+        만들지 않으며(보던 목록과 선택이 갑자기 바뀌지 않도록), 이동하려는 항목이 그 사이
+        사라졌다면 이동하지 않고 안내함.
+    """
+
+    def __init__(self, parent, app, sources):
+        self.app = app
+        self.sources = sources
+        self.results = []  # 결과 목록의 각 행에 대응 (행의 iid가 이 리스트의 인덱스)
+        self.status_text = "검색"
+
+        # ---- 검색어 입력창 + [검색] 버튼 ----
+        query_row = ttk.Frame(parent)
+        query_row.pack(fill=tk.X, padx=10, pady=(10, 0))
+        self.query_var = tk.StringVar()
+        self.query_entry = ttk.Entry(query_row, textvariable=self.query_var, font=UI_FONT)
+        self.query_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        self.search_button = ttk.Button(query_row, text="검색", command=self.run_search)
+        self.search_button.pack(side=tk.LEFT)
+
+        # ---- 검색 범위 체크박스 (검색 대상 탭마다 하나씩) ----
+        scope_row = ttk.Frame(parent)
+        scope_row.pack(fill=tk.X, padx=10, pady=(8, 0))
+        ttk.Label(scope_row, text="검색 범위", font=UI_FONT).pack(side=tk.LEFT, padx=(0, 12))
+        self.scope_vars = {}
+        for tab in sources:
+            var = tk.BooleanVar(value=True)
+            self.scope_vars[tab.search_key] = var
+            ttk.Checkbutton(scope_row, text=f"{tab.search_icon} {tab.search_label}",
+                            variable=var).pack(side=tk.LEFT, padx=(0, 12))
+
+        # ---- 결과 요약 문구 (검색 전에는 사용법 안내) ----
+        self.summary_var = tk.StringVar(value="공백으로 구분한 여러 단어는 모두 포함된 항목을 찾습니다.")
+        ttk.Label(parent, textvariable=self.summary_var, font=("맑은 고딕", 11)).pack(
+            fill=tk.X, padx=10, pady=(8, 4))
+
+        # ---- 검색 결과 목록 ----
+        # Search.Treeview 스타일(글꼴/행 높이)은 apply_custom_styles()가 정의함
+        list_frame = ttk.Frame(parent)
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        list_frame.rowconfigure(0, weight=1)
+        list_frame.columnconfigure(0, weight=1)
+        self.tree = ttk.Treeview(list_frame, columns=("kind", "where", "text"), show="headings",
+                                 selectmode="browse", style="Search.Treeview")
+        self.tree.heading("kind", text="구분")
+        self.tree.heading("where", text="위치")
+        self.tree.heading("text", text="내용")
+        self.tree.column("kind", width=120, anchor="w", stretch=False)
+        self.tree.column("where", width=190, anchor="w", stretch=False)
+        self.tree.column("text", width=300, anchor="w", stretch=True)
+        scroll = ttk.Scrollbar(list_frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scroll.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        scroll.grid(row=0, column=1, sticky="ns")
+
+        # 키 입력은 bind_when_visible로 걺: 탭을 바꿔도 포커스는 안 보이는 위젯에 남아 있어서,
+        # 가드가 없으면 다른 탭에서 누른 Enter가 보이지 않는 이 탭의 검색/이동을 실행함
+        for sequence in ("<Return>", "<KP_Enter>"):
+            bind_when_visible(self.query_entry, sequence, self.run_search)
+            bind_when_visible(self.tree, sequence, self._open_selected)
+        bind_when_visible(self.query_entry, "<Down>", self._on_query_down)
+        self.tree.bind("<Double-1>", self._on_double_click)
+
+    # ---- MemoApp이 공통으로 호출하는 인터페이스 ----
+
+    def set_content_font(self, font_tuple):
+        pass  # 결과 목록 글꼴/행 높이는 SettingsManager가 apply_custom_styles()로 설정함
+
+    def apply_theme_colors(self, colors):
+        pass  # Entry/Checkbutton/Treeview는 sv_ttk가 테마를 자동으로 입힘
+
+    def get_status_text(self):
+        return self.status_text
+
+    def get_copy_target(self):
+        return None  # 복사할 내용 없음
+
+    def on_activated(self, event=None):
+        """이 탭으로 전환되면 바로 검색어를 입력할 수 있게 입력창에 포커스를 줌. 탭이 아직 화면에
+        배치되기 전이면 포커스가 옮겨지지 않아 앞 탭의 (안 보이는) 위젯에 남으므로, 먼저 배치를
+        끝낸 뒤 지정함 (안 그러면 MemoApp._rescue_hidden_focus가 결과 목록으로 옮겨 버림)"""
+        self.app.root.update_idletasks()
+        self.query_entry.focus_set()
+
+    # ---- 탭 전용/공통 단축키 인터페이스 (MemoApp이 활성 탭에 위임함) ----
+
+    def focus_primary(self, event=None):
+        """Ctrl+T / Ctrl+F: 검색어 입력창으로 (적어 둔 검색어는 전체 선택)"""
+        self.query_entry.focus_set()
+        self.query_entry.select_range(0, tk.END)
+        return "break"
+
+    def focus_content(self, event=None):
+        """Ctrl+M: 결과 목록으로"""
+        self._focus_results()
+        return "break"
+
+    def focus_list(self, event=None):
+        """Ctrl+L: 결과 목록으로"""
+        self._focus_results()
+        return "break"
+
+    # ---- 검색 ----
+
+    def _set_summary(self, text):
+        """결과 요약을 이 탭의 안내 줄과 상태표시줄에 함께 보여줌"""
+        self.summary_var.set(text)
+        self.status_text = text
+        self.app.update_status_bar()
+
+    def _clear_results(self):
+        self.tree.delete(*self.tree.get_children())
+        self.results = []
+
+    def run_search(self, event=None):
+        """[검색] 버튼/Enter: 검색어와 체크한 범위로 검색해 결과 목록을 새로 채움"""
+        self._clear_results()
+        query = self.query_var.get().strip()
+        terms = parse_search_terms(query)
+        if not terms:
+            self._set_summary("검색어를 입력하세요.")
+            self.query_entry.focus_set()
+            return "break"
+        selected = [tab for tab in self.sources if self.scope_vars[tab.search_key].get()]
+        if not selected:
+            self._set_summary("검색 범위를 하나 이상 선택하세요.")
+            return "break"
+
+        found, counts = [], []
+        for tab in selected:
+            matches = tab.search_matches(terms)
+            for match in matches:
+                match["tab"] = tab
+            found.extend(matches)
+            counts.append(f"{tab.search_label} {len(matches)}")
+
+        shown = found[:SEARCH_MAX_RESULTS]
+        for index, match in enumerate(shown):
+            tab = match["tab"]
+            self.tree.insert("", "end", iid=str(index),
+                             values=(f"{tab.search_icon} {tab.search_label}", match["where"], match["text"]))
+        self.results = shown
+
+        if not found:
+            shown_query = query if len(query) <= 30 else query[:30] + "…"
+            self._set_summary(f"'{shown_query}'에 대한 검색 결과가 없습니다.")
+        elif len(found) > len(shown):
+            self._set_summary(f"검색 결과 {len(found)}건 중 앞의 {len(shown)}건만 표시합니다. "
+                              "검색어를 더 구체적으로 입력해 보세요.")
+        else:
+            self._set_summary(f"검색 결과 {len(found)}건 ({', '.join(counts)})")
+        return "break"
+
+    # ---- 결과 목록 조작 ----
+
+    def _focus_results(self):
+        """결과 목록에 포커스를 줌 (선택된 행이 없으면 첫 행을 선택)"""
+        self.tree.focus_set()
+        children = self.tree.get_children()
+        if children and not self.tree.selection():
+            self.tree.selection_set(children[0])
+            self.tree.focus(children[0])
+
+    def _on_query_down(self, event=None):
+        """검색어 입력창에서 ↓: 결과 목록으로 내려가 방향키로 고르게 함"""
+        if not self.tree.get_children():
+            return None
+        self._focus_results()
+        return "break"
+
+    def _on_double_click(self, event):
+        row = self.tree.identify_row(event.y)  # 머리글을 더블클릭한 경우는 빈 문자열
+        if row:
+            self._open_result(row)
+
+    def _open_selected(self, event=None):
+        selection = self.tree.selection()
+        if selection:
+            self._open_result(selection[0])
+        return "break"
+
+    def _open_result(self, row_id):
+        """결과 하나를 열어 그 항목으로 이동함. 그 사이 항목이 바뀌거나 지워져서 이동할 수
+        없으면 안내함"""
+        result = self.results[int(row_id)]
+        if not self.app.go_to_search_result(result["tab"], result["target"]):
+            messagebox.showinfo(
+                "검색", "검색한 뒤 이 항목이 바뀌었거나 삭제되어 이동할 수 없습니다.\n다시 검색해 주세요.",
+                parent=self.app.root)
+
+
+# ============================================================================
+# 휴지통 창
+# ============================================================================
+
+class TrashDialog(tk.Toplevel):
+    """휴지통 창 (Ctrl+Shift+X / 각 탭의 [🗑] 버튼): 삭제한 항목을 모아 보여주고 복원하거나 완전히 지움.
+
+      - 목록은 최근에 지운 것부터이고, [구분]으로 탭별로 걸러 볼 수 있음. 여러 개를 한꺼번에 고를 수 있음
+        (Ctrl/Shift+클릭, Ctrl+A). 항목을 하나 고르면 아래에 전체 내용이 보임.
+      - 복원: [복원] 버튼 / Enter / 더블클릭. 영구 삭제: [영구 삭제] 버튼 / Delete 키.
+        [비우기]는 지금 목록에 보이는 항목 전체를 완전히 지움. Esc로 닫음.
+      - 복원/삭제를 실제로 하는 것은 MemoApp(restore_from_trash/delete_from_trash)이고, 이 창은
+        MemoApp.trash 목록을 보여주고 조작을 전달할 뿐임. 창이 떠 있는 동안에는 다른 창을 조작할 수 없게
+        (grab) 해서, 보고 있는 목록이 그 사이 바뀌는 일이 없음.
+    """
+
+    FILTER_ALL = "전체"
+
+    def __init__(self, app):
+        super().__init__(app.root)
+        self.app = app
+        self.title("휴지통")
+        scale = max(1.0, self.winfo_fpixels("1i") / 96.0)
+        self.minsize(int(640 * scale), int(440 * scale))
+        width, height = int(800 * scale), int(580 * scale)
+        root = app.root
+        x = root.winfo_rootx() + max(0, (root.winfo_width() - width) // 2)
+        y = root.winfo_rooty() + max(0, (root.winfo_height() - height) // 2)
+        self.geometry(f"{width}x{height}+{x}+{y}")
+        self.transient(root)
+        colors = THEME_COLORS.get(app.settings_mgr.theme_mode, THEME_COLORS["light"])
+        self._shown_ids = []   # 지금 목록에 보이는 항목 id (보이는 순서)
+        self._details = {}     # 항목 id → 아래 칸에 보여줄 전체 내용
+
+        # 위: 구분 필터 + 개수/보관 기간 안내
+        top = ttk.Frame(self)
+        top.pack(side=tk.TOP, fill=tk.X, padx=12, pady=(12, 6))
+        ttk.Label(top, text="구분", font=UI_FONT).pack(side=tk.LEFT, padx=(0, 6))
+        self.filter_var = tk.StringVar(value=self.FILTER_ALL)
+        labels = [self.FILTER_ALL] + [self._tab_label(tab) for tab in app.trash_tabs()]
+        self.filter_combo = ttk.Combobox(top, textvariable=self.filter_var, values=labels,
+                                         state="readonly", width=14)
+        self.filter_combo.pack(side=tk.LEFT)
+        self.filter_combo.bind("<<ComboboxSelected>>", lambda e: self._refresh())
+        self.count_label = ttk.Label(top, text="", font=("맑은 고딕", 10))
+        self.count_label.pack(side=tk.RIGHT)
+
+        # 아래부터 먼저 배치: 창을 줄여도 버튼과 안내가 가려지지 않고 목록만 줄어듦
+        buttons = ttk.Frame(self)
+        buttons.pack(side=tk.BOTTOM, fill=tk.X, padx=12, pady=(4, 12))
+        self.restore_button = ttk.Button(buttons, text="복원", command=self._restore_selected, width=10)
+        self.restore_button.pack(side=tk.LEFT)
+        self.purge_button = ttk.Button(buttons, text="영구 삭제", command=self._purge_selected, width=10)
+        self.purge_button.pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(buttons, text="닫기", command=self.destroy, width=10).pack(side=tk.RIGHT)
+        ttk.Button(buttons, text="비우기", command=self._purge_shown, width=10).pack(side=tk.RIGHT, padx=(0, 6))
+
+        self.message_var = tk.StringVar(value="")
+        ttk.Label(self, textvariable=self.message_var, font=("맑은 고딕", 10),
+                  foreground=colors["success_fg"]).pack(side=tk.BOTTOM, fill=tk.X, padx=12, pady=(0, 4))
+
+        self.detail = tk.Text(self, height=7, wrap="word", state=tk.DISABLED,
+                              font=app.settings_mgr.content_font, bg=colors["bg"], fg=colors["fg"],
+                              relief=tk.FLAT, highlightthickness=1, highlightbackground=colors["border"],
+                              padx=8, pady=6)
+        self.detail.pack(side=tk.BOTTOM, fill=tk.X, padx=12, pady=(6, 4))
+
+        list_frame = ttk.Frame(self)
+        list_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=12)
+        list_frame.rowconfigure(0, weight=1)
+        list_frame.columnconfigure(0, weight=1)
+        self.tree = ttk.Treeview(list_frame, columns=("time", "kind", "where", "text"), show="headings",
+                                 selectmode="extended", style="Trash.Treeview")
+        # 열 너비는 글꼴(pt)과 달리 화면 배율을 자동으로 따르지 않으므로 scale을 곱함
+        for column, title, col_width, stretch in (("time", "삭제 일시", 160, False), ("kind", "구분", 130, False),
+                                                  ("where", "위치", 150, False), ("text", "내용", 260, True)):
+            self.tree.heading(column, text=title)
+            self.tree.column(column, width=int(col_width * scale), anchor="w", stretch=stretch)
+        scroll = ttk.Scrollbar(list_frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scroll.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        scroll.grid(row=0, column=1, sticky="ns")
+
+        self.tree.bind("<<TreeviewSelect>>", lambda e: self._on_select())
+        self.tree.bind("<Return>", self._restore_selected)
+        self.tree.bind("<KP_Enter>", self._restore_selected)
+        self.tree.bind("<Delete>", self._purge_selected)
+        self.tree.bind("<Control-a>", self._select_all)
+        self.tree.bind("<Double-1>", self._on_double_click)
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.bind("<Destroy>", self._on_destroy)
+
+        self._refresh()
+        self.tree.focus_set()
+        if self.tree.get_children():
+            first = self.tree.get_children()[0]
+            self.tree.selection_set(first)
+            self.tree.focus(first)
+        try:
+            self.wait_visibility()
+            self.grab_set()
+        except tk.TclError:
+            pass  # 화면에 보이기 전이라 잡지 못해도 창은 쓸 수 있음
+
+    @staticmethod
+    def _tab_label(tab):
+        """구분 칸에 보여줄 탭 이름 (검색 탭과 같은 아이콘+이름)"""
+        return f"{tab.search_icon} {tab.search_label}"
+
+    def _on_destroy(self, event):
+        if event.widget is self:
+            self.app._trash_dialog = None
+
+    def _describe(self, entry, tab):
+        try:
+            return tab.trash_describe(entry)
+        except Exception as e:  # 데이터가 이상해도 목록 전체가 안 뜨는 일이 없도록 함
+            log_message(f"휴지통 항목 표시 실패: {e!r}")
+            return {"where": "", "text": "(표시할 수 없는 항목)", "detail": ""}
+
+    def _refresh(self):
+        """목록을 다시 그림 (최근에 지운 것이 위로). 필터가 있으면 그 탭의 항목만 보여줌"""
+        wanted = self.filter_var.get()
+        self.tree.delete(*self.tree.get_children())
+        self._shown_ids, self._details = [], {}
+        for entry in reversed(self.app.trash):
+            tab = self.app.trash_tab_for_kind(entry["kind"])
+            if tab is None:
+                continue
+            label = self._tab_label(tab)
+            if wanted != self.FILTER_ALL and label != wanted:
+                continue
+            info = self._describe(entry, tab)
+            self.tree.insert("", "end", iid=entry["id"], values=(
+                format_trash_time(entry["deleted_at"]), label, info["where"], info["text"]))
+            self._shown_ids.append(entry["id"])
+            self._details[entry["id"]] = info["detail"]
+        total = len(self.app.trash)
+        shown = len(self._shown_ids)
+        count = f"{shown}개" if wanted == self.FILTER_ALL else f"{shown}개 (전체 {total}개)"
+        self.count_label.config(text=f"{count} · 삭제 후 {TRASH_RETENTION_DAYS}일이 지나면 자동으로 완전히 삭제됩니다")
+        self._on_select()
+
+    def _set_detail(self, text):
+        self.detail.config(state=tk.NORMAL)
+        self.detail.delete("1.0", tk.END)
+        self.detail.insert("1.0", text)
+        self.detail.config(state=tk.DISABLED)
+
+    def _on_select(self):
+        selected = self.tree.selection()
+        state = ["!disabled"] if selected else ["disabled"]
+        self.restore_button.state(state)
+        self.purge_button.state(state)
+        if len(selected) == 1:
+            self._set_detail(self._details.get(selected[0], ""))
+        elif selected:
+            self._set_detail(f"{len(selected)}개 항목이 선택되었습니다.")
+        else:
+            self._set_detail("휴지통이 비어 있습니다." if not self._shown_ids else "")
+
+    def _select_all(self, event=None):
+        self.tree.selection_set(self.tree.get_children())
+        return "break"
+
+    def _on_double_click(self, event):
+        row = self.tree.identify_row(event.y)  # 머리글을 더블클릭한 경우는 빈 문자열
+        if row:
+            self.tree.selection_set(row)
+            self._restore_selected()
+
+    def _restore_selected(self, event=None):
+        """[복원]/Enter/더블클릭: 고른 항목을 원래 탭으로 되돌림"""
+        ids = list(self.tree.selection())
+        if not ids:
+            return "break"
+        restored, failures, notes = self.app.restore_from_trash(ids)
+        self._refresh()
+        parts = [f"{restored}개 항목을 복원했습니다."] if restored else []
+        if failures:
+            reasons = "; ".join(dict.fromkeys(reason for _, reason in failures))
+            parts.append(f"{len(failures)}개는 복원하지 못했습니다 ({reasons}).")
+        parts.extend(notes[:2])
+        message = " ".join(parts)
+        self.message_var.set(message)
+        if restored:
+            self.app.show_status_message(f"휴지통에서 {restored}개 항목을 복원했습니다.")
+        return "break"
+
+    def _purge(self, ids, question):
+        if not ids or not messagebox.askyesno("영구 삭제", question, icon="warning", parent=self):
+            return
+        removed = self.app.delete_from_trash(ids)
+        self._refresh()
+        self.message_var.set(f"{removed}개 항목을 완전히 삭제했습니다.")
+
+    def _purge_selected(self, event=None):
+        """[영구 삭제]/Delete: 고른 항목을 휴지통에서 완전히 지움 (되돌릴 수 없으므로 확인함)"""
+        ids = list(self.tree.selection())
+        self._purge(ids, f"선택한 {len(ids)}개 항목을 완전히 삭제할까요?\n이 작업은 되돌릴 수 없습니다.")
+        return "break"
+
+    def _purge_shown(self):
+        """[비우기]: 지금 목록에 보이는 항목을 모두 완전히 지움 (필터가 있으면 그 구분만)"""
+        ids = list(self._shown_ids)
+        scope = "휴지통의" if self.filter_var.get() == self.FILTER_ALL else f"'{self.filter_var.get()}' 구분의"
+        self._purge(ids, f"{scope} {len(ids)}개 항목을 모두 완전히 삭제할까요?\n이 작업은 되돌릴 수 없습니다.")
+
+
+# ============================================================================
+# 공휴일 편집 창 (달력메모 탭의 숨김 기능)
+# ============================================================================
+
+class HolidayEditorDialog(tk.Toplevel):
+    """공휴일 편집 창 (달력메모 탭에서 Ctrl+Shift+H): holidays.json을 직접 편집하거나, GitHub/다른 파일에서
+    가져와 업데이트함.
+
+      - 편집은 작업용 사본(working)에서 하고 [저장]을 눌러야만 파일에 반영됨. 파일을 열 때의 내용(original)과
+        다른 항목은 색으로 표시되고 추가/수정/삭제 개수가 요약에 보임. 닫을 때 저장하지 않은 변경이 있으면 물어봄.
+      - 날짜 하나에 이름은 하나뿐임 (같은 날 공휴일이 겹치면 "A·B"처럼 한 이름으로 적음).
+      - 가져오기는 "병합"(기본: 같은 날짜는 가져온 내용이 우선, 내 목록에만 있는 날짜는 유지) 또는 "교체"를
+        고르고, 무엇이 바뀌는지 확인한 뒤에 작업용 사본에만 반영함 (이때도 파일은 [저장] 전에는 그대로).
+      - GitHub 내려받기는 별도 스레드로 해서 창이 멈추지 않음. 내려받은 내용은 holidays.json을 읽을 때와
+        같은 규칙(clean_holidays)으로 걸러서 쓰고, 쓸 수 있는 항목이 하나도 없으면 적용하지 않음.
+      - 창이 떠 있는 동안에는 다른 창을 조작할 수 없음(grab).
+    """
+
+    ALL_YEARS = "전체"
+    MODE_MERGE, MODE_REPLACE = "merge", "replace"
+    WEEKDAYS = ("월", "화", "수", "목", "금", "토", "일")
+
+    @classmethod
+    def open_for(cls, app, tab):
+        """편집 창을 열거나, 이미 열려 있으면 그 창을 앞으로 가져옴"""
+        existing = tab._holiday_dialog
+        if existing is not None and existing.winfo_exists():
+            existing.lift()
+            existing.focus_force()
+            return existing
+        tab._holiday_dialog = cls(app, tab)
+        return tab._holiday_dialog
+
+    def __init__(self, app, tab):
+        super().__init__(app.root)
+        self.app, self.tab, self.store = app, tab, app.store
+        self.title("공휴일 편집 (holidays.json)")
+        scale = max(1.0, self.winfo_fpixels("1i") / 96.0)
+        # 화면 배율이 크거나 화면이 작아도 창(특히 아래쪽 버튼)이 화면 밖으로 나가지 않도록 상한을 둠
+        screen_w, screen_h = self.winfo_screenwidth(), self.winfo_screenheight()
+        width, height = min(int(800 * scale), screen_w - 40), min(int(660 * scale), screen_h - 100)
+        self.minsize(min(int(700 * scale), width), min(int(560 * scale), height))
+        root = app.root
+        x = max(0, min(root.winfo_rootx() + (root.winfo_width() - width) // 2, screen_w - width))
+        y = max(0, min(root.winfo_rooty() + (root.winfo_height() - height) // 2, screen_h - height - 40))
+        self.geometry(f"{width}x{height}+{x}+{y}")
+        self.transient(root)
+        colors = THEME_COLORS.get(app.settings_mgr.theme_mode, THEME_COLORS["light"])
+
+        holidays, skipped, unreadable = self.store.read_holidays_for_editing()
+        self.original = dict(holidays)  # 파일을 열 때(또는 마지막으로 저장했을 때)의 내용: 변경 표시/변경 여부의 기준
+        self.working = dict(holidays)   # 편집 중인 내용 (저장하기 전에는 파일에 반영되지 않음)
+        self._signature = self.store.holidays_signature()  # 열 때의 파일 상태: 그 사이 바뀌었는지 확인용
+        self._backed_up = False  # 이 창에서 .bak을 이미 만들었는지 (첫 저장에서만 만듦)
+        self._busy = False
+        self._fetch_token = 0
+        self._fetch_queue = queue.Queue()
+        self._fetch_deadline = 0.0
+
+        # 위: 연도 필터 + 요약
+        top = ttk.Frame(self)
+        top.pack(side=tk.TOP, fill=tk.X, padx=12, pady=(12, 6))
+        ttk.Label(top, text="연도", font=UI_FONT).pack(side=tk.LEFT, padx=(0, 6))
+        self.year_var = tk.StringVar(value=self.ALL_YEARS)
+        self.year_combo = ttk.Combobox(top, textvariable=self.year_var, state="readonly", width=10)
+        self.year_combo.pack(side=tk.LEFT)
+        self.year_combo.bind("<<ComboboxSelected>>", lambda e: self._refresh())
+        self.summary_label = ttk.Label(top, text="", font=("맑은 고딕", 10))
+        self.summary_label.pack(side=tk.RIGHT)
+
+        # 아래쪽 요소들을 먼저 배치: 창을 줄여도 버튼이 가려지지 않고 목록만 줄어듦
+        bottom = ttk.Frame(self)
+        bottom.pack(side=tk.BOTTOM, fill=tk.X, padx=12, pady=(4, 12))
+        self.save_button = ttk.Button(bottom, text="저장", command=self._save, width=10)
+        self.save_button.pack(side=tk.LEFT)
+        ttk.Button(bottom, text="닫기", command=self._close, width=10).pack(side=tk.RIGHT)
+
+        self.message_var = tk.StringVar(value="")
+        ttk.Label(self, textvariable=self.message_var, font=("맑은 고딕", 10), foreground=colors["success_fg"],
+                  wraplength=int(760 * scale), justify=tk.LEFT).pack(side=tk.BOTTOM, fill=tk.X, padx=12, pady=(0, 4))
+
+        source = ttk.LabelFrame(self, text="가져와서 업데이트")
+        source.pack(side=tk.BOTTOM, fill=tk.X, padx=12, pady=(8, 6))
+        self.mode_var = tk.StringVar(value=self.MODE_MERGE)
+        ttk.Radiobutton(source, text="병합 (같은 날짜는 가져온 내용으로 바꾸고, 내 목록에만 있는 날짜는 유지)",
+                        variable=self.mode_var, value=self.MODE_MERGE).pack(anchor="w", padx=8, pady=(6, 0))
+        ttk.Radiobutton(source, text="교체 (가져온 파일의 내용만 남기고 나머지는 삭제)",
+                        variable=self.mode_var, value=self.MODE_REPLACE).pack(anchor="w", padx=8, pady=(0, 2))
+        source_buttons = ttk.Frame(source)
+        source_buttons.pack(fill=tk.X, padx=8, pady=(2, 8))
+        self.github_button = ttk.Button(source_buttons, text="GitHub에서 가져오기", command=self._start_github_fetch)
+        self.github_button.pack(side=tk.LEFT)
+        self.file_button = ttk.Button(source_buttons, text="파일에서 가져오기...", command=self._import_from_file)
+        self.file_button.pack(side=tk.LEFT, padx=(6, 0))
+
+        edit = ttk.Frame(self)
+        edit.pack(side=tk.BOTTOM, fill=tk.X, padx=12, pady=(8, 0))
+        ttk.Label(edit, text="날짜", font=UI_FONT).pack(side=tk.LEFT, padx=(0, 4))
+        self.date_entry = ttk.Entry(edit, width=13, font=UI_FONT)
+        self.date_entry.pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Label(edit, text="이름", font=UI_FONT).pack(side=tk.LEFT, padx=(0, 4))
+        self.name_entry = ttk.Entry(edit, font=UI_FONT)
+        self.name_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        ttk.Button(edit, text="추가 / 수정", command=self._apply_entry).pack(side=tk.LEFT)
+        self.delete_button = ttk.Button(edit, text="삭제", command=self._delete_selected)
+        self.delete_button.pack(side=tk.LEFT, padx=(6, 0))
+
+        list_frame = ttk.Frame(self)
+        list_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=12)
+        list_frame.rowconfigure(0, weight=1)
+        list_frame.columnconfigure(0, weight=1)
+        self.tree = ttk.Treeview(list_frame, columns=("date", "weekday", "name"), show="headings",
+                                 selectmode="extended", style="Holiday.Treeview")
+        for column, title, col_width, stretch in (("date", "날짜", 130, False), ("weekday", "요일", 60, False),
+                                                  ("name", "이름", 400, True)):
+            self.tree.heading(column, text=title)
+            self.tree.column(column, width=int(col_width * scale), anchor="w", stretch=stretch)
+        self.tree.tag_configure("changed", foreground=colors["accent"])  # 파일을 열 때와 다른 항목
+        scroll = ttk.Scrollbar(list_frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scroll.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        scroll.grid(row=0, column=1, sticky="ns")
+
+        self.tree.bind("<<TreeviewSelect>>", lambda e: self._on_select())
+        self.tree.bind("<Delete>", lambda e: self._delete_selected())
+        self.tree.bind("<Control-a>", lambda e: (self.tree.selection_set(self.tree.get_children()), "break")[1])
+        for entry in (self.date_entry, self.name_entry):
+            entry.bind("<Return>", lambda e: (self._apply_entry(), "break")[1])
+        self.bind("<Control-s>", lambda e: (self._save(), "break")[1])
+        self.bind("<Escape>", lambda e: self._close())
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.bind("<Destroy>", self._on_destroy)
+
+        notes = []
+        if unreadable:
+            notes.append(f"{unreadable} 빈 목록으로 시작합니다. 저장하면 기존 파일은 holidays.json.bak에 보관되고 "
+                         "새 파일로 바뀝니다.")
+        if skipped:
+            notes.append(f"holidays.json에서 형식이 맞지 않는 항목 {len(skipped)}개는 목록에 표시되지 않으며, "
+                         "저장하면 파일에서 빠집니다 (이전 파일은 holidays.json.bak에 보관됩니다).")
+        self.message_var.set(" ".join(notes))
+        self._refresh()
+        self.date_entry.focus_set()
+        try:
+            self.wait_visibility()
+            self.grab_set()
+        except tk.TclError:
+            pass  # 화면에 보이기 전이라 잡지 못해도 창은 쓸 수 있음
+
+    # ---- 목록 ----
+
+    def _weekday(self, key):
+        return self.WEEKDAYS[date.fromisoformat(key).weekday()]
+
+    def _diff(self):
+        """파일을 열 때(또는 마지막으로 저장했을 때)와 비교한 (추가, 수정, 삭제) 날짜 목록"""
+        added = [d for d in self.working if d not in self.original]
+        changed = [d for d in self.working if d in self.original and self.original[d] != self.working[d]]
+        removed = [d for d in self.original if d not in self.working]
+        return added, changed, removed
+
+    def _refresh(self, select=None):
+        """목록/연도 필터/요약/[저장] 버튼 상태를 작업용 사본에 맞춰 다시 그림. select는 선택할 날짜 목록"""
+        years = sorted({d[:4] for d in self.working})
+        choices = [self.ALL_YEARS] + years
+        self.year_combo.config(values=choices)
+        if self.year_var.get() not in choices:
+            self.year_var.set(self.ALL_YEARS)
+        wanted_year = self.year_var.get()
+        self.tree.delete(*self.tree.get_children())
+        shown = 0
+        for key in sorted(self.working):
+            if wanted_year != self.ALL_YEARS and not key.startswith(wanted_year):
+                continue
+            changed = self.original.get(key) != self.working[key]
+            self.tree.insert("", "end", iid=key, values=(key, self._weekday(key), self.working[key]),
+                             tags=("changed",) if changed else ())
+            shown += 1
+        for key in select or []:
+            if self.tree.exists(key):
+                self.tree.selection_add(key)
+                self.tree.see(key)
+        added, changed, removed = self._diff()
+        text = f"{shown}개 표시 (전체 {len(self.working)}개)"
+        if added or changed or removed:
+            text += f" · 저장 안 된 변경: 추가 {len(added)} · 수정 {len(changed)} · 삭제 {len(removed)}"
+        self.summary_label.config(text=text)
+        self.save_button.state(["!disabled"] if (added or changed or removed) else ["disabled"])
+
+    def _on_select(self):
+        """목록에서 항목 하나를 고르면 아래 입력칸에 채워 바로 고칠 수 있게 함"""
+        selection = self.tree.selection()
+        if len(selection) == 1:
+            key = selection[0]
+            self.date_entry.delete(0, tk.END)
+            self.date_entry.insert(0, key)
+            self.name_entry.delete(0, tk.END)
+            self.name_entry.insert(0, self.working.get(key, ""))
+
+    def _apply_entry(self):
+        """[추가 / 수정] / Enter: 입력칸의 날짜와 이름을 작업용 사본에 반영함 (같은 날짜가 있으면 이름을 수정)"""
+        date_key = normalize_date_key(self.date_entry.get())
+        name = self.name_entry.get().strip()
+        if date_key is None:
+            messagebox.showwarning(
+                "공휴일 편집", f"날짜를 YYYY-MM-DD 형식으로 입력해 주세요. (예: 2026-09-25, {CAL_MIN_YEAR}~{CAL_MAX_YEAR}년)",
+                parent=self)
+            self.date_entry.focus_set()
+            return
+        if not name:
+            messagebox.showwarning("공휴일 편집", "공휴일 이름을 입력해 주세요.", parent=self)
+            self.name_entry.focus_set()
+            return
+        old = self.working.get(date_key)
+        self.working[date_key] = name
+        self.tree.selection_remove(*self.tree.selection())
+        self._refresh(select=[date_key])
+        if old is None:
+            self.message_var.set(f"{date_key} '{name}'을(를) 추가했습니다. [저장]을 눌러야 파일에 반영됩니다.")
+        elif old != name:
+            self.message_var.set(f"{date_key}의 이름을 '{old}'에서 '{name}'(으)로 수정했습니다. "
+                                 "[저장]을 눌러야 파일에 반영됩니다.")
+        else:
+            self.message_var.set(f"{date_key}은(는) 이미 같은 이름으로 등록되어 있습니다.")
+
+    def _delete_selected(self):
+        """[삭제] / Delete: 고른 항목들을 작업용 사본에서 뺌 (파일은 [저장]을 눌러야 바뀜)"""
+        keys = list(self.tree.selection())
+        if not keys:
+            return
+        for key in keys:
+            self.working.pop(key, None)
+        self._refresh()
+        self.message_var.set(f"{len(keys)}개 항목을 목록에서 뺐습니다. [저장]을 눌러야 파일에 반영됩니다.")
+
+    # ---- 가져오기 (GitHub / 파일) ----
+
+    def _set_busy(self, busy):
+        self._busy = busy
+        state = ["disabled"] if busy else ["!disabled"]
+        self.github_button.state(state)
+        self.file_button.state(state)
+
+    def _start_github_fetch(self):
+        """[GitHub에서 가져오기]: 별도 스레드로 내려받고, 결과는 큐로 받아 화면 스레드에서 처리함"""
+        if self._busy:
+            return
+        self._fetch_token += 1
+        token = self._fetch_token
+        self._fetch_deadline = time.monotonic() + HOLIDAYS_FETCH_TOTAL_SECONDS
+        self._set_busy(True)
+        self.message_var.set("GitHub에서 가져오는 중입니다...")
+
+        def worker():
+            try:
+                self._fetch_queue.put((token, fetch_holidays_text(), None))
+            except HolidayFetchError as e:
+                self._fetch_queue.put((token, None, str(e)))
+            except Exception as e:  # 예상 못한 오류도 화면에는 안내로 전달함
+                self._fetch_queue.put((token, None, f"알 수 없는 오류가 발생했습니다 ({e.__class__.__name__})."))
+
+        threading.Thread(target=worker, daemon=True).start()
+        self.after(100, self._poll_fetch, token)
+
+    def _poll_fetch(self, token):
+        """내려받기 결과가 왔는지 확인함 (창이 닫혔거나 더 새로운 요청/취소가 있으면 무시)"""
+        if not self.winfo_exists() or token != self._fetch_token:
+            return
+        try:
+            while True:
+                got_token, text, error = self._fetch_queue.get_nowait()
+                if got_token != token:
+                    continue
+                self._set_busy(False)
+                if error:
+                    self.message_var.set("GitHub에서 가져오지 못했습니다.")
+                    messagebox.showerror(
+                        "GitHub 가져오기 실패",
+                        f"{error}\n\n[파일에서 가져오기...]로 내려받아 둔 holidays.json을 직접 불러올 수도 있습니다.",
+                        parent=self)
+                else:
+                    self._import_text(text, "GitHub 파일")
+                return
+        except queue.Empty:
+            pass
+        if time.monotonic() > self._fetch_deadline:
+            self._fetch_token += 1  # 늦게 도착하는 결과는 무시함
+            self._set_busy(False)
+            self.message_var.set("GitHub에서 가져오지 못했습니다.")
+            messagebox.showerror(
+                "GitHub 가져오기 실패",
+                "응답 시간이 초과되었습니다. 네트워크 상태를 확인해 주세요.\n\n"
+                "[파일에서 가져오기...]로 내려받아 둔 holidays.json을 직접 불러올 수도 있습니다.", parent=self)
+            return
+        self.after(100, self._poll_fetch, token)
+
+    def _import_from_file(self):
+        """[파일에서 가져오기...]: 다른 곳에서 받아 온 holidays.json을 같은 방식(병합/교체)으로 불러옴"""
+        path = filedialog.askopenfilename(
+            title="공휴일 JSON 파일 선택", filetypes=[("JSON 파일", "*.json"), ("모든 파일", "*.*")], parent=self)
+        if not path:
+            return
+        try:
+            if os.path.getsize(path) > HOLIDAYS_MAX_BYTES:
+                raise ValueError("파일이 너무 커서 불러오지 않았습니다.")
+            with open(path, "r", encoding="utf-8-sig") as f:
+                text = f.read()
+        except (OSError, UnicodeDecodeError, ValueError) as e:
+            detail = str(e) if isinstance(e, ValueError) else "파일을 읽지 못했습니다 (UTF-8 텍스트 파일인지 확인해 주세요)."
+            messagebox.showerror("공휴일 편집", detail, parent=self)
+            return
+        self._import_text(text, f"파일 '{os.path.basename(path)}'")
+
+    def _import_text(self, text, source):
+        """내려받은/불러온 JSON 텍스트를 검증하고, 무엇이 바뀌는지 확인받은 뒤 작업용 사본에 반영함.
+        (파일은 [저장]을 누르기 전에는 바뀌지 않음)"""
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            messagebox.showerror("공휴일 편집", f"{source}이(가) 올바른 JSON이 아니라서 적용하지 않았습니다.", parent=self)
+            return
+        if not isinstance(data, dict):
+            messagebox.showerror("공휴일 편집", f"{source}이(가) {{\"날짜\": \"이름\"}} 형태가 아니라서 적용하지 않았습니다.",
+                                 parent=self)
+            return
+        incoming, problems = clean_holidays(data)
+        if not incoming:
+            messagebox.showerror(
+                "공휴일 편집", f"{source}에서 사용할 수 있는 공휴일 항목을 찾지 못해 적용하지 않았습니다.", parent=self)
+            return
+        replace = self.mode_var.get() == self.MODE_REPLACE
+        result, stats = merge_holidays(self.working, incoming, replace)
+        removed = stats["local_only"] if replace else []
+        if not stats["added"] and not stats["changed"] and not removed:
+            messagebox.showinfo("공휴일 편집", f"{source}의 내용이 지금 목록과 같아서 바뀌는 것이 없습니다.", parent=self)
+            return
+        lines = [f"{source}: 공휴일 {len(incoming)}개" + (f" (형식이 맞지 않아 건너뜀 {len(problems)}개)" if problems else ""),
+                 "", f"· 새로 추가: {len(stats['added'])}개"]
+        if stats["changed"]:
+            lines.append(f"· 같은 날짜인데 이름이 달라 가져온 내용으로 바꿈: {len(stats['changed'])}개")
+            for key in stats["changed"][:5]:
+                lines.append(f"     {key}: {self.working[key]} → {incoming[key]}")
+            if len(stats["changed"]) > 5:
+                lines.append(f"     ... 외 {len(stats['changed']) - 5}개")
+        lines.append(f"· 변경 없음: {stats['same']}개")
+        if stats["local_only"]:
+            lines.append(f"· 내 목록에만 있는 날짜: {len(stats['local_only'])}개 " + ("(교체하므로 삭제됩니다)" if replace else "(유지됩니다)"))
+        lines += ["", f"방식: {'교체' if replace else '병합'}", "[저장]을 누르기 전에는 holidays.json이 바뀌지 않습니다.",
+                  "계속할까요?"]
+        if not messagebox.askyesno("가져오기 확인", "\n".join(lines), parent=self):
+            return
+        self.working = result
+        self.tree.selection_remove(*self.tree.selection())
+        self._refresh(select=stats["added"] + stats["changed"])
+        self.message_var.set(
+            f"{source}의 내용을 {'교체' if replace else '병합'}했습니다 (추가 {len(stats['added'])} · 수정 {len(stats['changed'])}"
+            + (f" · 삭제 {len(removed)}" if removed else "") + "). 파란 글씨가 바뀐 항목이고, [저장]을 눌러야 파일에 반영됩니다.")
+
+    # ---- 저장 / 닫기 ----
+
+    def _save(self):
+        """[저장]/Ctrl+S: 작업용 사본을 holidays.json에 쓰고 달력에 바로 반영함. 성공하면 True"""
+        added, changed, removed = self._diff()
+        if not (added or changed or removed):
+            return True
+        if self.store.holidays_signature() != self._signature:
+            if not messagebox.askyesno(
+                    "공휴일 편집",
+                    "이 창을 여는 동안 holidays.json이 다른 곳에서 바뀌었습니다.\n"
+                    "저장하면 그 변경은 사라지고 지금 편집한 내용으로 바뀝니다 (이전 파일은 holidays.json.bak에 보관됩니다).\n\n"
+                    "그래도 저장할까요?", icon="warning", parent=self):
+                return False
+        try:
+            self.store.write_holidays(self.working, backup=not self._backed_up)
+        except Exception as e:
+            messagebox.showerror("저장 실패", f"holidays.json을 저장하지 못했습니다 ({e.__class__.__name__}).\n"
+                                 "저장 폴더의 쓰기 권한이나 다른 프로그램이 파일을 쓰고 있지 않은지 확인해 주세요.",
+                                 parent=self)
+            return False
+        self._backed_up = True
+        self.original = dict(self.working)
+        self._signature = self.store.holidays_signature()
+        self.tab.reload_holidays()
+        self._refresh()
+        self.message_var.set(f"저장했습니다 (공휴일 {len(self.working)}개). 달력에 바로 반영되었습니다.")
+        return True
+
+    def _close(self):
+        """[닫기]/Esc: 저장하지 않은 변경이 있으면 저장 여부를 물어본 뒤 닫음.
+        닫았으면 True, 사용자가 취소했거나 저장에 실패해 열어 둔 채면 False를 반환함
+        (메인 창을 종료할 때도 MemoApp.on_closing이 이 반환값을 확인함)"""
+        if any(self._diff()):
+            answer = messagebox.askyesnocancel(
+                "공휴일 편집",
+                "저장하지 않은 변경이 있습니다.\n\n[예] 저장하고 닫기\n[아니오] 저장하지 않고 닫기\n[취소] 계속 편집",
+                icon="warning", parent=self)
+            if answer is None:
+                return False
+            if answer and not self._save():
+                return False
+        self._fetch_token += 1  # 진행 중인 내려받기가 있어도 결과는 무시함
+        self.destroy()
+        return True
+
+    def _on_destroy(self, event):
+        if event.widget is self:
+            self.tab._holiday_dialog = None
+
 
 class MemoApp:
     """최상위 지휘자: 메뉴, 전역 단축키, 창 생명주기, 테마/상태표시줄처럼 여러
     탭을 넘나드는 것만 여기 남기고, 각 탭 자체의 UI/데이터/동작은
-    GeneralMemoTab / CalendarMemoTab / ChecklistTab / CollectionTab에 위임함."""
+    GeneralMemoTab / CalendarMemoTab / ChecklistTab / CollectionTab / SearchTab에 위임함.
+    휴지통(trash.json)은 네 탭이 함께 쓰므로 이 클래스가 관리함 (trash_add/restore_from_trash 등)."""
 
     def __init__(self, root):
         self.root = root
@@ -5351,7 +7283,7 @@ class MemoApp:
         try:
             self.root.iconbitmap(default=resource_path("ad.ico"))
         except Exception as e:
-            print(f"아이콘 로드 실패: {e}")
+            log_message(f"아이콘 로드 실패: {e}")
 
         self.store = MemoStore(get_app_dir())
         self.settings_mgr = SettingsManager(self)
@@ -5366,6 +7298,11 @@ class MemoApp:
         # 메시지의 "원래대로 복귀" 타이머가 나중 메시지를 덮어쓰지 않도록, 자신이 아직 최신인지
         # 이 번호로 확인함
         self._status_msg_token = 0
+        # 휴지통(trash.json): 지운 항목 목록 (구조는 파일 위 "휴지통" 주석 참고). 열려 있는 휴지통 창이
+        # 있으면 _trash_dialog에 담아 같은 창이 여러 개 뜨지 않게 함
+        self.trash = self.store.load_trash()
+        self._trash_dialog = None
+        self._purge_expired_trash()
 
         # Windows 11 스타일(sv_ttk) 테마 적용 (sv_ttk 미설치 시 기본 ttk 테마 사용)
         if sv_ttk:
@@ -5375,6 +7312,9 @@ class MemoApp:
         # 이 처리가 끝나기 전에 위젯을 만들면 일부가 기본 회색(#d9d9d9 계열)으로 만들어지므로
         # 위젯 생성 전에 큐를 한 번 비움
         self.root.update_idletasks()
+        # 이 앱의 커스텀 ttk 스타일은 테마별로 저장되므로, 탭 위젯을 만들기 전에 현재 테마에 설정함
+        # (테마를 바꿀 때마다 다시 설정하는 곳은 apply_custom_styles 참고)
+        apply_custom_styles(self.settings_mgr.content_font)
 
         # 상태표시줄 생성 (side=BOTTOM으로 먼저 pack해야, 이후 fill=BOTH+expand=True로
         # pack되는 notebook이 이 영역까지 침범하지 않음 - pack은 호출 순서대로 공간을 배정함)
@@ -5382,12 +7322,7 @@ class MemoApp:
         self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
 
         # 메뉴막대 아래 최상위 탭 - 하위의 [월별보기]/[1년전체보기]/[목록보기] 탭과 구분되도록
-        # 최상위 탭 전용 스타일(더 큰 볼드체 + 넉넉한 여백)을 적용함.
-        top_tab_style = ttk.Style()
-        top_tab_style.configure("TopLevel.TNotebook.Tab", font=("맑은 고딕", 13, "bold"),
-                                padding=(24, 4))
-        top_tab_style.configure("TopLevel.TNotebook", tabmargins=(6, 8, 6, 0))
-
+        # 최상위 탭 전용 스타일(TopLevel.TNotebook, apply_custom_styles에서 정의)을 적용함.
         self.notebook = ttk.Notebook(root, style="TopLevel.TNotebook")
         self.notebook.pack(fill=tk.BOTH, expand=True)
 
@@ -5395,20 +7330,26 @@ class MemoApp:
         calendar_frame = ttk.Frame(self.notebook)
         checklist_frame = ttk.Frame(self.notebook)
         collection_frame = ttk.Frame(self.notebook)
+        search_frame = ttk.Frame(self.notebook)
         self.notebook.add(general_frame, text="📝 일반메모")
         self.notebook.add(calendar_frame, text="📅 달력메모")
         self.notebook.add(checklist_frame, text="✅ 체크리스트")
         self.notebook.add(collection_frame, text="📚 컬렉션")
+        self.notebook.add(search_frame, text="🔍 검색")
 
         self.general_tab = GeneralMemoTab(general_frame, self)
         self.calendar_tab = CalendarMemoTab(calendar_frame, self)
         self.checklist_tab = ChecklistTab(checklist_frame, self)
         self.collection_tab = CollectionTab(collection_frame, self)
+        # 검색 탭은 앞의 네 탭을 검색 대상으로 받음 (체크박스도 이 순서로 생김)
+        self.search_tab = SearchTab(search_frame, self, [
+            self.general_tab, self.calendar_tab, self.checklist_tab, self.collection_tab])
         # 새 탭을 추가하려면 위처럼 만든 뒤 여기 리스트에 추가하면, 테마/글꼴/
         # 상태표시줄이 자동으로 그 탭까지 반영함 (파일 위 안내 주석 참고).
         # 이 리스트 순서는 반드시 위 notebook.add() 순서와 같아야 함 - _active_tab()이
         # notebook 탭 인덱스로 이 리스트를 그대로 찾아 쓰기 때문
-        self.tabs = [self.general_tab, self.calendar_tab, self.checklist_tab, self.collection_tab]
+        self.tabs = [self.general_tab, self.calendar_tab, self.checklist_tab, self.collection_tab,
+                     self.search_tab]
         self._last_active_tab = self.tabs[0]
 
         self.create_menu()
@@ -5424,9 +7365,11 @@ class MemoApp:
         # 공통 단축키 (탭마다 의미가 다름 - 각 라우터 메서드 주석 참고)
         self.root.bind("<Control-n>", self._on_ctrl_n_key)
         self.root.bind("<Control-d>", self._on_ctrl_d_key)
+        self._install_ctrl_d_guard()
         self.root.bind("<Control-m>", self._on_ctrl_m_key)
         self.root.bind("<Control-l>", self.focus_on_listbox)
         self.root.bind("<Control-t>", self.focus_on_title)
+        self.root.bind("<Control-f>", self.focus_search)
         self.root.bind("<Prior>", self._on_prior_key)
         self.root.bind("<Next>", self._on_next_key)
         self.root.bind("<Alt-t>", self.insert_datetime)
@@ -5446,6 +7389,8 @@ class MemoApp:
         # 고급 사용자용 숨김 기능: 버튼 없이 단축키로만 진입 (달력메모 탭 전용)
         self.root.bind("<Control-Shift-D>", self._on_ctrl_shift_d_key)
         self.root.bind("<Control-Shift-N>", self._on_ctrl_shift_n_key)
+        self.root.bind("<Control-Shift-X>", self.open_trash)
+        self.root.bind("<Control-Shift-H>", self._on_ctrl_shift_h_key)
         self.root.bind("<F2>", self._on_f2_key)
         self.root.bind("<F1>", self._show_shortcut_help)
 
@@ -5498,6 +7443,149 @@ class MemoApp:
         self._after_save("checklists", ok, notify)
         return ok
 
+    def save_trash(self, notify=True):
+        ok = self.store.save_trash(self.trash)
+        self._after_save("trash", ok, notify)
+        return ok
+
+    # ---- 휴지통 (구조/설계 이유는 파일 위 "휴지통" 주석, 탭이 구현할 것은 "앱 구조 안내" 참고) ----
+
+    def trash_tabs(self):
+        """휴지통에 항목을 넣을 수 있는(trash_kinds가 있는) 탭들"""
+        return [tab for tab in self.tabs if getattr(tab, "trash_kinds", None)]
+
+    def trash_tab_for_kind(self, kind):
+        return next((tab for tab in self.trash_tabs() if kind in tab.trash_kinds), None)
+
+    def trash_add(self, kind, data, origin=None, parent=None):
+        """지운 항목 하나를 휴지통에 넣고 저장함. 각 탭의 삭제 코드가 지우기 직전에 호출함.
+        지운 뒤가 아니라 지우기 전에 저장하는 이유: 그 사이 앱이 죽어도 \"데이터에서는 지워졌는데
+        휴지통에도 없는\" 상태는 생기지 않고, 최악의 경우 양쪽에 다 남음. (data는 복사해 두므로
+        이후 원본이 바뀌어도 휴지통 내용은 그대로임)
+
+        반환값: True면 호출한 쪽이 지워도 되는 상태, False면 휴지통에 보관하지 못했고 사용자가
+        삭제를 취소한 것이므로 호출한 쪽은 아무것도 지우지 말고 그대로 끝내야 함."""
+        return self.trash_add_many([(kind, data, origin)], parent=parent)
+
+    def trash_add_many(self, items, parent=None):
+        """여러 항목을 한 번에 휴지통에 넣고 한 번만 저장함 (달력메모 일괄 삭제용). items는
+        (kind, data, origin) 목록. 반환값의 의미는 trash_add 참고.
+
+        휴지통 파일에 저장하지 못하면(디스크 가득, 쓰기 권한, 시작할 때 읽지 못해 덮어쓰기가
+        막힌 경우 등) 삭제를 계속할지 먼저 물어봄. 계속하면 항목은 이번 실행 중에는 휴지통
+        창에 보이지만(다음 저장에 성공하면 파일에도 기록됨) 종료 후에는 복원할 수 없을 수 있음."""
+        if not items:
+            return True
+        stamp = now_iso()
+        added_ids = []
+        for kind, data, origin in items:
+            entry_id = short_id()
+            added_ids.append(entry_id)
+            self.trash.append({
+                "id": entry_id, "kind": kind, "deleted_at": stamp,
+                "data": copy.deepcopy(data), "origin": dict(origin or {}),
+            })
+        if self.save_trash(notify=False):
+            return True
+        proceed = messagebox.askyesno(
+            "휴지통 저장 실패",
+            f"삭제할 내용을 휴지통 파일에 저장하지 못했습니다.\n{self._save_error_detail()}\n"
+            "이대로 삭제하면 프로그램을 종료한 뒤에는 복원할 수 없을 수 있습니다.\n\n"
+            "그래도 삭제하시겠습니까?",
+            icon="warning", parent=parent or self.root)
+        if not proceed:
+            doomed = set(added_ids)
+            self.trash = [entry for entry in self.trash if entry["id"] not in doomed]
+            return False
+        return True
+
+    def _save_error_detail(self):
+        """마지막 저장 실패 사유를 안내 문구(줄바꿈으로 끝남)로 만듦"""
+        error = self.store.last_write_error
+        if isinstance(error, WriteBlockedError):
+            # 시작할 때 읽지 못한 파일: 디스크/권한 문제가 아니라 덮어쓰기 방지 때문이므로 그 사유만 안내
+            return f"{error}\n"
+        if error is not None:
+            return f"사유: {error}\n디스크 공간이나 저장 폴더의 쓰기 권한을 확인해주세요.\n"
+        return "디스크 공간이나 저장 폴더의 쓰기 권한을 확인해주세요.\n"
+
+    def _purge_expired_trash(self):
+        """보관 기간이 지난 항목을 휴지통에서 완전히 지움. 지운 개수를 반환함"""
+        now = datetime.now()
+        kept = [entry for entry in self.trash if not is_trash_expired(entry, now)]
+        purged = len(self.trash) - len(kept)
+        if purged:
+            self.trash = kept
+            self.save_trash(notify=False)
+        return purged
+
+    def restore_from_trash(self, entry_ids):
+        """휴지통의 entry_ids 항목들을 원래 탭으로 복원함. (복원한 개수, 실패 목록[(항목, 이유)],
+        안내 문구 목록)을 반환함. 나중에 지운 것부터 되돌려야 순서(index)가 원래대로 맞으므로
+        최근 항목부터 처리함. 복원에 실패한 항목은 휴지통에 그대로 남김.
+        저장 순서: 탭 데이터를 먼저 저장하고 그다음 휴지통에서 지움 (중간에 죽어도 양쪽에 남을 뿐
+        잃어버리지 않도록 trash_add와 같은 방향)."""
+        wanted = set(entry_ids)
+        self._commit_inline_edits()
+        restored_ids, failures, notes, targets = [], [], [], {}
+        entries_by_tab = {}
+        for entry in reversed(self.trash):
+            if entry["id"] not in wanted:
+                continue
+            tab = self.trash_tab_for_kind(entry["kind"])
+            if tab is None:
+                failures.append((entry, "복원할 탭을 찾을 수 없습니다."))
+                continue
+            try:
+                note, target = tab.trash_restore(entry)
+            except ValueError as e:
+                failures.append((entry, str(e)))
+                continue
+            except Exception as e:  # 예상 못한 오류가 나머지 항목의 복원까지 막지 않도록 함
+                log_message(f"휴지통 복원 실패: {e!r}")
+                failures.append((entry, "알 수 없는 오류로 복원하지 못했습니다."))
+                continue
+            restored_ids.append(entry["id"])
+            if note:
+                notes.append(note)
+            targets.setdefault(tab, []).append(target)
+            entries_by_tab.setdefault(tab, []).append(entry)
+        done = set()
+        for tab, tab_targets in targets.items():
+            # trash_finish_restore는 탭 데이터를 저장한 결과(실패하면 False)를 반환함.
+            # 저장에 실패한 탭의 항목은 휴지통에서 지우지 않음 (파일에는 아직 휴지통에만 남아 있으므로)
+            if tab.trash_finish_restore(tab_targets) is False:
+                for entry in entries_by_tab[tab]:
+                    failures.append((entry, "화면에는 복원했지만 파일에 저장하지 못해 휴지통에 남겨 두었습니다. "
+                                            "저장 문제를 해결한 뒤 화면의 항목을 확인하세요."))
+            else:
+                done.update(entry["id"] for entry in entries_by_tab[tab])
+        if done:
+            self.trash = [entry for entry in self.trash if entry["id"] not in done]
+            self.save_trash()
+        return len(done), failures, list(dict.fromkeys(notes))
+
+    def delete_from_trash(self, entry_ids):
+        """휴지통에서 entry_ids 항목들을 완전히 지움 (되돌릴 수 없음). 지운 개수를 반환함"""
+        doomed = set(entry_ids)
+        kept = [entry for entry in self.trash if entry["id"] not in doomed]
+        removed = len(self.trash) - len(kept)
+        if removed:
+            self.trash = kept
+            self.save_trash()
+        return removed
+
+    def open_trash(self, event=None):
+        """Ctrl+Shift+X / 각 탭의 [🗑] 버튼: 휴지통 창을 엶 (이미 열려 있으면 그 창을 앞으로 가져옴)"""
+        if self._trash_dialog is not None and self._trash_dialog.winfo_exists():
+            self._trash_dialog.lift()
+            self._trash_dialog.focus_force()
+            return "break"
+        self._commit_inline_edits()  # 열려 있는 인라인 편집을 확정한 뒤에 데이터를 건드림
+        self._purge_expired_trash()
+        self._trash_dialog = TrashDialog(self)
+        return "break"
+
     def _debounced_save(self, key, save_func, delay_ms=AUTOSAVE_DEBOUNCE_MS):
         """key로 구분되는 저장을 delay_ms 뒤로 미루고, 그 사이에 또 호출되면
         이전 예약을 취소하고 다시 미룸. (연속으로 키 입력이 들어오는 동안은
@@ -5526,7 +7614,7 @@ class MemoApp:
             return
         self._save_failed_keys.add(key)
         label = {"memos": "일반메모", "calendar_memos": "달력메모", "collections": "컬렉션",
-                  "checklists": "체크리스트"}.get(key, key)
+                  "checklists": "체크리스트", "trash": "휴지통"}.get(key, key)
         error = self.store.last_write_error
         if isinstance(error, WriteBlockedError):
             # 시작할 때 읽지 못한 파일: 디스크/권한 문제가 아니라 덮어쓰기 방지 때문이므로 그 사유만 안내
@@ -5535,6 +7623,14 @@ class MemoApp:
             detail = f"사유: {error}\n디스크 공간이나 저장 폴더의 쓰기 권한을 확인해주세요.\n"
         else:
             detail = "디스크 공간이나 저장 폴더의 쓰기 권한을 확인해주세요.\n"
+        if key == "trash":
+            messagebox.showerror(
+                "저장 실패",
+                f"휴지통 저장에 실패했습니다.\n{detail}"
+                "휴지통의 변경 내용이 파일에 기록되지 않았습니다.",
+                parent=self.root,
+            )
+            return
         messagebox.showerror(
             "저장 실패",
             f"{label} 저장에 실패했습니다.\n{detail}"
@@ -5556,7 +7652,8 @@ class MemoApp:
         self.file_menu = tk.Menu(menubar, tearoff=0, postcommand=self._update_file_menu)
         # 가져오기/내보내기는 "지금 보고 있는 탭"의 데이터에 대해 동작하고, 라벨에 그 탭 이름이
         # 표시됨 (_update_file_menu 참고)
-        self.file_menu.add_command(label="가져오기...", command=self.import_current_tab)
+        self.file_menu.add_command(label="가져오기 (덮어쓰기)...", command=self.import_current_tab)
+        self.file_menu.add_command(label="병합하여 가져오기...", command=self.merge_import_current_tab)
         self.file_menu.add_command(label="내보내기...", command=self.export_current_tab)
         self.file_menu.add_separator()
         self.file_menu.add_command(label="전체 백업 (zip)...", command=self.backup_all)
@@ -5590,17 +7687,24 @@ class MemoApp:
     # 옮길 때는 전체 백업(zip)/백업에서 복원을 씀.
 
     _FILE_MENU_IMPORT = 0
-    _FILE_MENU_EXPORT = 1
+    _FILE_MENU_MERGE = 1
+    _FILE_MENU_EXPORT = 2
 
     def _update_file_menu(self):
-        """파일 메뉴가 열리기 직전에 호출되어, 가져오기/내보내기 라벨에 활성 탭 이름을 표시함.
-        (가져오기/내보내기 훅을 구현하지 않은 탭이면 두 항목을 비활성화함)"""
-        label = getattr(self._active_tab(), "transfer_label", None)
+        """파일 메뉴가 열리기 직전에 호출되어, 가져오기/병합/내보내기 라벨에 활성 탭 이름을 표시함.
+        (훅을 구현하지 않은 탭이면 해당 항목을 비활성화함)"""
+        tab = self._active_tab()
+        label = getattr(tab, "transfer_label", None)
         if label:
-            import_text, export_text, state = f"[{label}] 가져오기...", f"[{label}] 내보내기...", tk.NORMAL
+            import_text, export_text, state = (f"[{label}] 가져오기 (덮어쓰기)...", f"[{label}] 내보내기...",
+                                               tk.NORMAL)
+            merge_text, merge_state = f"[{label}] 병합하여 가져오기...", (
+                tk.NORMAL if hasattr(tab, "transfer_merge") else tk.DISABLED)
         else:
-            import_text, export_text, state = "가져오기...", "내보내기...", tk.DISABLED
+            import_text, export_text, state = "가져오기 (덮어쓰기)...", "내보내기...", tk.DISABLED
+            merge_text, merge_state = "병합하여 가져오기...", tk.DISABLED
         self.file_menu.entryconfigure(self._FILE_MENU_IMPORT, label=import_text, state=state)
+        self.file_menu.entryconfigure(self._FILE_MENU_MERGE, label=merge_text, state=merge_state)
         self.file_menu.entryconfigure(self._FILE_MENU_EXPORT, label=export_text, state=state)
 
     def _transfer_tabs(self):
@@ -5663,6 +7767,61 @@ class MemoApp:
                 messagebox.showwarning(
                     "저장 실패",
                     f"[{label}] 데이터를 화면에는 반영했지만 파일 저장에 실패했습니다.\n"
+                    "디스크 공간이나 저장 폴더의 쓰기 권한을 확인해주세요." + self.backup_note(backup_path),
+                    parent=self.root)
+        except Exception as e:
+            messagebox.showerror("오류", self._describe_transfer_error(label, e), parent=self.root)
+
+    def merge_import_current_tab(self):
+        """파일 > [현재 탭] 병합하여 가져오기...: JSON 파일의 내용을 활성 탭의 기존 데이터에 "더하기만" 함
+        (기존 데이터를 통째로 바꾸는 가져오기(덮어쓰기)와 달리 아무 것도 지우지 않음). 흐름:
+        파일 검증(덮어쓰기 가져오기와 같은 transfer_parse) → 합친 결과를 계산만 해서 무엇이 얼마나
+        바뀔지 확인창에 보여줌 → 확인하면 자동 백업 → 반영·저장. 규칙은 파일 위 "병합 가져오기" 주석 참고."""
+        tab = self._active_tab()
+        label = getattr(tab, "transfer_label", None)
+        if not label or not hasattr(tab, "transfer_merge"):
+            return
+        filepath = filedialog.askopenfilename(
+            title=f"[{label}] 병합하여 가져오기 (JSON 파일만 지원)",
+            filetypes=[("JSON 파일", "*.json"), ("모든 파일", "*.*")],
+            parent=self.root,
+        )
+        if not filepath:
+            return
+        try:
+            # utf-8-sig: 메모장 등으로 저장해 BOM이 붙은 JSON 파일도 읽을 수 있게 함
+            with open(filepath, "r", encoding="utf-8-sig") as f:
+                text = f.read()
+            incoming = self._parse_transfer_text(tab, text)
+            # 편집 중인 내용(인라인 편집 등)을 먼저 데이터에 반영해야 합친 결과에서 빠지지 않음
+            self._commit_inline_edits()
+            merged, report = tab.transfer_merge(incoming)
+            summary = "\n".join(f"· {line}" for line in report["lines"])
+            if not report["changes"]:
+                messagebox.showinfo(
+                    "병합", f"[{label}] 새로 추가할 내용이 없습니다.\n(가져온 파일의 내용이 모두 이미 있습니다.)"
+                            f"\n\n{summary}", parent=self.root)
+                return
+            if not messagebox.askyesno(
+                    "병합 확인",
+                    f"가져온 파일을 [{label}]의 기존 데이터에 병합하시겠습니까?\n\n{summary}\n\n"
+                    "기존 데이터는 지우거나 덮어쓰지 않고 추가만 합니다.\n"
+                    f"(실행 직전에 현재 데이터가 {AUTO_BACKUP_DIRNAME} 폴더에 자동 백업됩니다.)",
+                    parent=self.root):
+                return
+            proceed, backup_path = self.auto_backup_before("before-merge")
+            if not proceed:
+                return
+            ok = tab.transfer_apply(merged)
+            self.update_status_bar()
+            if ok:
+                messagebox.showinfo(
+                    "성공", f"[{label}] 병합을 완료했습니다.\n\n{summary}" + self.backup_note(backup_path),
+                    parent=self.root)
+            else:
+                messagebox.showwarning(
+                    "저장 실패",
+                    f"[{label}] 병합한 데이터를 화면에는 반영했지만 파일 저장에 실패했습니다.\n"
                     "디스크 공간이나 저장 폴더의 쓰기 권한을 확인해주세요." + self.backup_note(backup_path),
                     parent=self.root)
         except Exception as e:
@@ -6034,6 +8193,28 @@ class MemoApp:
             return method(event)
         return "break"
 
+    _CTRL_D_GUARD_CLASSES = ("Text", "Entry", "TEntry", "Spinbox", "TSpinbox", "TCombobox")
+
+    def _install_ctrl_d_guard(self):
+        """Tk의 Text/Entry는 Ctrl+D에 \"커서 오른쪽 글자 삭제\"라는 기본 동작이 있고, 위젯 클래스
+        바인딩은 root 바인딩보다 먼저 실행됨. 그래서 메인 창의 입력 위젯에서 Ctrl+D를 누르면
+        글자가 하나 지워진 뒤에 삭제 확인창이 뜨고, [아니오]를 눌러도 글자는 이미 지워져 있었음.
+        입력 위젯 자체에 Ctrl+D를 바인딩해 앱의 Ctrl+D 동작이 \"처리했으면\"(\"break\" 반환)
+        기본 동작이 실행되지 않게 함. 처리하지 않은 경우(None)는 기본 동작 그대로임.
+        (대화상자(Toplevel) 안의 위젯과 나중에 만들어지는 인라인 편집창은 대상이 아님)"""
+        def guard(event):
+            return self._on_ctrl_d_key(event)
+
+        def walk(widget):
+            for child in widget.winfo_children():
+                if isinstance(child, tk.Toplevel):
+                    continue
+                if child.winfo_class() in self._CTRL_D_GUARD_CLASSES:
+                    child.bind("<Control-d>", guard)
+                walk(child)
+
+        walk(self.root)
+
     def _on_ctrl_d_key(self, event=None):
         """Ctrl+D: 탭마다 "선택된 것 삭제"의 의미가 다름
         (일반메모: 제목/내용에 포커스가 있을 때 메모 삭제 / 달력메모: 선택된 날짜의 메모 내용
@@ -6062,6 +8243,24 @@ class MemoApp:
         self._dispatch_to_active_tab("focus_primary", event)
         return "break"
 
+    def focus_search(self, event=None):
+        """Ctrl+F: 어느 탭에서든 검색 탭으로 이동해 검색어 입력창에 포커스를 줌"""
+        self.notebook.select(self.tabs.index(self.search_tab))
+        self.root.update_idletasks()  # 검색 탭이 화면에 배치된 뒤에 포커스를 지정하기 위함
+        self.search_tab.focus_primary()
+        return "break"
+
+    def go_to_search_result(self, tab, target):
+        """검색 탭에서 결과를 열었을 때: 그 결과가 속한 탭으로 전환하고 해당 항목으로 이동함.
+        항목이 사라져 이동할 수 없으면 검색 탭으로 되돌아오고 False를 반환함."""
+        search_page = self.notebook.select()
+        self.notebook.select(self.tabs.index(tab))
+        self.root.update_idletasks()  # 그 탭이 화면에 배치된 뒤에 선택/스크롤/포커스를 지정하기 위함
+        if tab.goto_search_result(target):
+            return True
+        self.notebook.select(search_page)
+        return False
+
     def _on_alt_m_key(self, event=None):
         return self._dispatch_to_active_tab("on_alt_m", event)
 
@@ -6086,6 +8285,9 @@ class MemoApp:
     def _on_ctrl_shift_n_key(self, event=None):
         return self._dispatch_to_active_tab("on_ctrl_shift_n", event)
 
+    def _on_ctrl_shift_h_key(self, event=None):
+        return self._dispatch_to_active_tab("on_ctrl_shift_h", event)
+
     def _on_f2_key(self, event=None):
         return self._dispatch_to_active_tab("on_f2", event)
 
@@ -6106,7 +8308,29 @@ class MemoApp:
         on_activated = getattr(active, "on_activated", None)
         if on_activated:
             on_activated()
+        # 탭 전환 직후에는 새 탭의 위젯이 아직 화면에 배치되기 전이라 보이는지 판단할 수 없으므로,
+        # 배치가 끝난 뒤(idle)에 확인함
+        self.root.after_idle(self._rescue_hidden_focus)
         self.update_status_bar()
+
+    def _rescue_hidden_focus(self):
+        """탭을 바꿔도 키보드 포커스는 따라 옮겨지지 않아, 화면에서 사라진 위젯(앞 탭의 본문 입력창
+        등)이 포커스를 그대로 가지면 이후 입력과 키가 보이지 않는 탭의 메모로 들어감. 그런 경우에만
+        활성 탭의 내용 위젯(Ctrl+M과 같은 동작)으로 포커스를 옮기고, 그것도 안 되면(일반메모의 내용
+        입력창이 비활성) 탭 막대로 옮김. 이미 보이는 위젯에 포커스가 있으면 건드리지 않음."""
+        self.root.update_idletasks()
+
+        def hidden_focus():
+            try:
+                widget = self.root.focus_get()
+                return widget is not None and not widget.winfo_viewable()
+            except (KeyError, tk.TclError):  # 콤보박스 팝업 등 이름으로 찾을 수 없는 위젯
+                return False
+
+        if hidden_focus():
+            self._dispatch_to_active_tab("focus_content", None)
+            if hidden_focus():
+                self.notebook.focus_set()
 
     def _notify_holiday_problems(self):
         """holidays.json에서 형식이 맞지 않아 건너뛴 항목이 있으면 시작 후 한 번 안내함.
@@ -6138,6 +8362,7 @@ class MemoApp:
         테마를 제대로 반영하지 못하는 렌더링 문제를 보정한다."""
         if sv_ttk:
             sv_ttk.set_theme(self.settings_mgr.theme_mode, self.root)
+        apply_custom_styles(self.settings_mgr.content_font)
         apply_titlebar_theme(self.root, self.settings_mgr.theme_mode == "dark")
         self.apply_theme_colors()
 
@@ -6154,13 +8379,12 @@ class MemoApp:
                 # UI 레이아웃 완료 대기
                 self.root.update_idletasks()
                 self.root.geometry(geometry)
-                print(f"✅ 창 위치 복원: {geometry}")
             else:
                 # 잘못된 형식이면 기본값 사용
-                print(f"⚠️ 잘못된 geometry 형식: {geometry}")
+                log_message(f"잘못된 geometry 형식: {geometry}")
                 self.root.geometry("800x600+100+100")
         except Exception as e:
-            print(f"❌ 창 위치 복원 실패: {e}")
+            log_message(f"창 위치 복원 실패: {e}")
             self.root.geometry("800x600+100+100")
 
         self.general_tab.restore_layout()
@@ -6168,25 +8392,42 @@ class MemoApp:
         self.collection_tab.restore_layout()
 
     def on_closing(self):
-        # 디바운스로 미뤄둔 저장이 있다면 취소하고(중복 저장 방지),
-        # 아래에서 최신 상태를 바로 저장하므로 유실되는 내용은 없음
-        self._cancel_pending_saves()
-        # 컬렉션/체크리스트 탭에 열려 있는 인라인 편집이 있다면 커밋 후 저장하고,
-        # 컬렉션의 백그라운드 제목 수집 폴링도 멈춤 (파괴된 위젯에 접근하는 예외 방지)
+        # 1) 공휴일 편집 창이 열려 있으면 저장하지 않은 변경을 먼저 확인함. 메인 창의 X 버튼은
+        #    그 창의 모달 상태와 상관없이 눌릴 수 있고, 그냥 destroy하면 편집 중이던 내용이 묻지
+        #    않고 사라지므로, 사용자가 [취소]하거나 저장에 실패하면 종료를 중단함
+        holiday_dialog = self.calendar_tab._holiday_dialog
+        if holiday_dialog is not None and holiday_dialog.winfo_exists():
+            if not holiday_dialog._close():
+                return
+        # 2) 컬렉션/체크리스트 탭에 열려 있는 인라인 편집이 있다면 커밋 후 저장함
+        #    (컬렉션의 백그라운드 제목 수집 폴링은 종료가 확정된 뒤에 멈춤)
         self.collection_tab.on_deactivated()
-        self.collection_tab._stop_polling()
         self.checklist_tab.on_deactivated()
-        # 종료 전 설정 및 메모 저장 (창 크기, 위치 포함)
-        # (저장에 실패하면 아래에서 한 번에 안내하므로, 개별 저장 실패 팝업은 띄우지 않음)
-        memos_ok = self.save_memos(notify=False)
-        calendar_ok = self.save_calendar_memos(notify=False)
-        collections_ok = self.save_collections(notify=False)
-        checklists_ok = self.save_checklists(notify=False)
+        # 3) 종료 전 설정 및 메모 저장 (창 크기, 위치 포함)
+        #    (저장에 실패하면 아래에서 한 번에 안내하므로, 개별 저장 실패 팝업은 띄우지 않음)
+        results = {
+            "memos": self.save_memos(notify=False),
+            "calendar_memos": self.save_calendar_memos(notify=False),
+            "collections": self.save_collections(notify=False),
+            "checklists": self.save_checklists(notify=False),
+        }
+        # 방금 저장에 성공한 항목의 디바운스 예약만 취소함(중복 저장 방지). 저장에 실패한 항목의
+        # 예약은 남겨 두므로, 종료를 취소하고 계속 쓰면 그 예약이 다시 저장을 시도함
+        for key, ok in results.items():
+            if ok:
+                pending = self._pending_save_ids.pop(key, None)
+                if pending is not None:
+                    self.root.after_cancel(pending)
         self.settings_mgr.save()
-        if not (memos_ok and calendar_ok and collections_ok and checklists_ok):
+        failed = [key for key, ok in results.items() if not ok]
+        if failed:
+            # 아래 확인창이 떠 있는 동안 남은 예약 저장이 실행되며 저장 실패 팝업이 겹쳐 뜨지
+            # 않도록, 이미 알린 것으로 표시함 (그 저장이 다시 성공하면 표시가 지워짐)
+            self._save_failed_keys.update(failed)
             # 디스크 공간 부족/권한 문제 등으로 마지막 저장이 실패했는데도 그냥
             # 종료해버리면 방금 작성한 내용이 그대로 사라지므로, 사용자에게 알리고
-            # 종료 여부를 직접 선택하게 함
+            # 종료 여부를 직접 선택하게 함. 종료하지 않기로 하면 자동저장 예약과 제목 수집
+            # 폴링은 건드리지 않은 채 그대로 계속 사용할 수 있음
             if not messagebox.askyesno(
                 "저장 실패",
                 "저장에 실패했습니다. 지금 종료하면 마지막으로 입력한 내용이\n"
@@ -6194,6 +8435,10 @@ class MemoApp:
                 parent=self.root,
             ):
                 return
+        # 4) 종료 확정: 남은 예약 저장을 취소하고, 제목 수집 폴링을 멈춘 뒤
+        #    (파괴된 위젯에 접근하는 예외 방지) 창을 닫음
+        self._cancel_pending_saves()
+        self.collection_tab._stop_polling()
         self.root.destroy()
 
 
