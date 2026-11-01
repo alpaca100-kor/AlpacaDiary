@@ -25,6 +25,7 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+*.spec
 
 # 2. 파이썬 환경 설정 및 로컬 변수
 .env
