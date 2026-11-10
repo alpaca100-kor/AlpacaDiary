@@ -19,6 +19,7 @@ import uuid
 import queue
 import threading
 import html
+import unicodedata
 import webbrowser
 import configparser
 import bisect
@@ -196,18 +197,80 @@ def set_text_content(widget, text=""):
     widget.edit_reset()
 
 
+# 키 이벤트의 state 값에서 Shift가 눌렸는지 보는 비트 (Caps Lock은 0x2라 구분됨)
+SHIFT_STATE_MASK = 0x0001
+
+
+def letter_shortcut_variants(sequence):
+    """"<Control-n>", "<Control-Shift-X>"처럼 마지막이 영문자 한 글자인 바인딩 시퀀스를 대소문자 두 가지
+    ("<Control-n>", "<Control-N>")로 늘려 돌려줌. 글자가 아니면(F2, Tab 등) 그대로 하나만 돌려줌.
+
+    Windows의 Tk는 Caps Lock이 켜져 있으면 Shift를 안 눌러도 keysym이 대문자("N")로, Shift를 같이
+    누르면 오히려 소문자("n")로 들어옴. 한 가지 대소문자로만 바인딩하면 Caps Lock 상태에서 그 단축키가
+    통째로 먹히지 않으므로 두 가지를 모두 걸어야 함."""
+    parts = sequence[1:-1].split("-")
+    key = parts[-1]
+    if len(key) != 1 or not key.isalpha():
+        return [sequence]
+    variants = dict.fromkeys((key, key.lower(), key.upper()))
+    return ["<" + "-".join(parts[:-1] + [k]) + ">" for k in variants]
+
+
+def bind_letter_shortcut(widget, sequence, callback, add=None):
+    """widget.bind(sequence, callback)과 같지만 Caps Lock과 상관없이 동작하도록 대/소문자 시퀀스를 모두 바인딩함
+    (letter_shortcut_variants 참고). sequence에 Shift가 없는 경우("<Control-t>")에는 실제로 Shift를 누른 채
+    들어온 키(Ctrl+Shift+T 등)는 이 단축키로 처리하지 않고 그냥 통과시킴: 대문자 시퀀스를 추가해도 Shift가
+    "눌러도 무관"한 수식키로 취급되어 Ctrl+Shift+글자까지 가로채는 일을 막기 위함. (Shift가 시퀀스에 있는
+    "<Control-Shift-X>"는 Tk가 더 구체적인 쪽을 고르므로 그대로 둠)
+    반환값: 바인딩한 시퀀스 목록"""
+    wants_shift = "Shift" in sequence[1:-1].split("-")[:-1]
+    if wants_shift:
+        handler = callback
+    else:
+        def handler(event):
+            if event.state & SHIFT_STATE_MASK:
+                return None
+            return callback(event)
+    variants = letter_shortcut_variants(sequence)
+    for variant in variants:
+        widget.bind(variant, handler, add)
+    return variants
+
+
+def unbind_letter_shortcut(widget, sequence):
+    """bind_letter_shortcut이 건 대/소문자 바인딩을 모두 제거함"""
+    for variant in letter_shortcut_variants(sequence):
+        try:
+            widget.unbind(variant)
+        except tk.TclError:
+            pass
+
+
 def bind_redo_shortcuts(widget):
     """다시 실행(Redo)을 Ctrl+Y와 Ctrl+Shift+Z로 통일함. Tk의 기본 단축키는 플랫폼마다 달라서
     (X11은 Ctrl+Shift+Z, Windows는 Ctrl+Y) 직접 연결하며, "break"로 기본 바인딩이 한 번 더
-    실행되어 두 단계가 다시 실행되는 일을 막음. (취소는 모든 플랫폼에서 기본 Ctrl+Z)"""
-    def redo(event):
+    실행되어 두 단계가 다시 실행되는 일을 막음.
+
+    Caps Lock이 켜져 있으면 Ctrl+Z가 대문자 "Z"로 들어와서, Ctrl+Shift+Z용 바인딩이 Ctrl+Z(실행취소)까지
+    다시 실행으로 처리해 버림. 그래서 Ctrl+Z 계열은 대/소문자를 모두 직접 받아 Shift를 실제로 눌렀는지로
+    실행취소(Shift 없음)와 다시 실행(Shift 있음)을 구분함. 실행취소는 Tk 기본 동작(<<Undo>>)을 그대로 씀."""
+    def redo(event=None):
         try:
             widget.edit_redo()
         except tk.TclError:
             pass  # 다시 실행할 기록이 없음
         return "break"
-    for sequence in ("<Control-y>", "<Control-Y>", "<Control-Z>"):
+
+    def undo_or_redo(event):
+        if event.state & SHIFT_STATE_MASK:
+            return redo(event)
+        widget.event_generate("<<Undo>>")
+        return "break"
+
+    for sequence in ("<Control-y>", "<Control-Y>"):
         widget.bind(sequence, redo)
+    for sequence in ("<Control-z>", "<Control-Z>"):
+        widget.bind(sequence, undo_or_redo)
 
 
 def insert_text_as_one_undo_step(widget, text):
@@ -298,19 +361,30 @@ SEARCH_SNIPPET_BEFORE = 10
 SEARCH_SNIPPET_AFTER = 40
 
 
+def search_fold(text):
+    """검색에서 두 문자열을 비교할 수 있도록 형태를 맞춤: 합친 형태(NFC)로 통일하고 소문자로 바꿈.
+
+    같은 한글도 저장된 형태가 둘일 수 있음. 보통은 "회"가 한 글자(NFC)지만, 맥(Finder 파일명 등)에서
+    복사한 글은 "ㅎ+ㅚ"처럼 자모가 분리(NFD)되어 눈에는 같아도 문자열로는 달라서 그냥 비교하면 서로
+    검색되지 않음. 그래서 검색어와 검색 대상을 모두 NFC로 맞춘 뒤 비교함."""
+    return unicodedata.normalize("NFC", text).lower()
+
+
 def parse_search_terms(query):
-    """검색어를 공백으로 나눈 단어 목록(소문자)으로 바꿈. 단어가 하나도 없으면 빈 리스트."""
-    return [word.lower() for word in query.split()]
+    """검색어를 공백으로 나눈 단어 목록(NFC, 소문자)으로 바꿈. 단어가 하나도 없으면 빈 리스트."""
+    return [search_fold(word) for word in query.split()]
 
 
 def text_matches_terms(lowered_text, terms):
-    """소문자로 바꾼 문자열에 terms의 단어가 모두 들어 있는지 (대소문자 구분 없는 검색의 기준)"""
-    return all(term in lowered_text for term in terms)
+    """소문자로 바꾼 문자열에 terms의 단어가 모두 들어 있는지 (대소문자 구분 없는 검색의 기준).
+    terms는 NFC이므로 문자열도 NFC로 맞춰서 비교함(search_fold 참고)."""
+    folded = unicodedata.normalize("NFC", lowered_text)
+    return all(term in folded for term in terms)
 
 
 def first_matching_term(text, terms):
     """text에서 가장 앞쪽에 나오는 검색 단어를 돌려줌. 하나도 없으면 None."""
-    lowered = text.lower()
+    lowered = search_fold(text)
     best = None
     for term in terms:
         pos = lowered.find(term)
@@ -323,7 +397,9 @@ def make_search_snippet(text, terms):
     """결과 목록 한 줄에 보여줄 문구: 줄바꿈/연속 공백을 한 칸으로 줄인 뒤, 검색 단어가 처음 나오는
     곳의 앞뒤만 잘라서 돌려줌 (잘린 쪽은 …로 표시). 검색 단어가 text에 없으면(제목에만 일치한
     경우 등) text의 앞부분을 돌려줌."""
-    flat = re.sub(r"\s+", " ", text).strip()
+    # NFC로 맞춘 글을 보여줌: 일치한 위치를 NFC 기준으로 찾으므로, 자르는 글도 같은 기준이어야 어긋나지 않음
+    # (NFD로 저장된 글도 화면에서는 같은 모양이라 달라 보이지 않음)
+    flat = unicodedata.normalize("NFC", re.sub(r"\s+", " ", text)).strip()
     term = first_matching_term(flat, terms)
     pos = flat.lower().find(term) if term else 0
     start = max(0, pos - SEARCH_SNIPPET_BEFORE)
@@ -333,8 +409,10 @@ def make_search_snippet(text, terms):
 
 
 def place_cursor_at_term(widget, term):
-    """Text 위젯에서 term(소문자)이 처음 나오는 곳으로 커서를 옮기고 화면에 보이게 함 (검색 결과로
+    """Text 위젯에서 term(NFC, 소문자)이 처음 나오는 곳으로 커서를 옮기고 화면에 보이게 함 (검색 결과로
     이동한 뒤 긴 메모에서 일치한 곳을 바로 찾도록). term이 없거나 찾지 못하면 아무 것도 하지 않음.
+    메모가 자모 분리(NFD)로 저장돼 있어도 찾도록 term의 NFD 형태도 함께 찾아 더 앞쪽을 씀. (한 단어
+    안에서 NFC와 NFD가 섞여 있는 아주 드문 경우는 위치를 찾지 못해 커서를 옮기지 않음)
 
     주의: Text.search(nocase=True)는 쓰지 않음. 내용에 이모지가 하나라도 있으면 일부 Tk 8.6 빌드에서
     프로그램이 통째로 종료되는 문제가 있음. 대신 파이썬에서 대소문자 구분 없이 위치를 찾아 그 자리의
@@ -344,9 +422,13 @@ def place_cursor_at_term(widget, term):
     if not term:
         return
     content = widget.get("1.0", "end-1c")
-    pos = content.lower().find(term)
-    if pos < 0:
+    lowered = content.lower()
+    found = [(lowered.find(variant), variant)
+             for variant in dict.fromkeys((term, unicodedata.normalize("NFD", term)))]
+    found = [(pos, variant) for pos, variant in found if pos >= 0]
+    if not found:
         return
+    pos, term = min(found)
     try:
         index = widget.search(content[pos:pos + len(term)], "1.0", stopindex=tk.END, exact=True)
     except tk.TclError:
@@ -354,6 +436,59 @@ def place_cursor_at_term(widget, term):
     if index:
         widget.mark_set(tk.INSERT, index)
         widget.see(index)
+
+
+# ---- 한 줄 입력칸(Entry)에 붙여넣은 여러 줄 텍스트 정리 ----
+# Entry는 여러 줄을 붙여넣으면 줄바꿈 문자를 그대로 넣음. 그 값이 항목 내용/이름으로 저장되면 목록 행,
+# "[ ] 내용" 복사 양식, TXT 내보내기가 줄바꿈 때문에 깨지므로 저장하기 전에 정리함.
+
+def flatten_lines(text):
+    """줄바꿈으로 나뉜 글을 한 줄로 합침: 각 줄의 앞뒤 공백을 지우고 빈 줄은 버린 뒤 공백 한 칸으로 이음.
+    (줄 안의 공백은 그대로 둠) 한 줄짜리 글은 앞뒤 공백만 지운 것과 같음."""
+    return " ".join(line.strip() for line in text.splitlines() if line.strip())
+
+
+def to_single_line(text):
+    """줄바꿈이 없는 글은 그대로, 있으면(끝에 줄바꿈 하나만 있어도) flatten_lines로 한 줄로 만듦.
+    줄바꿈이 없는 글의 공백(앞뒤 포함)은 건드리지 않으므로 평소 입력 동작은 그대로임."""
+    return flatten_lines(text) if text.splitlines() != [text] else text
+
+
+def bind_single_line_paste(entry, after_paste=None):
+    """한 줄 입력칸(Entry)에 여러 줄 텍스트를 붙여넣으면 줄바꿈을 공백으로 합쳐 넣음 (flatten_lines 참고).
+    줄바꿈이 없는 텍스트는 Tk 기본 붙여넣기에 그대로 맡겨 동작이 달라지지 않음. 줄바꿈이 있을 때만
+    기본 동작(선택 영역을 지우고 커서 위치에 넣기)을 직접 수행함. Ctrl+V와 Shift+Insert 모두
+    <<Paste>>로 들어옴. after_paste가 있으면 붙여넣은 뒤 호출함 (저장 등).
+    이미 저장된 값은 건드리지 않고 새로 입력되는 값만 정리함."""
+    def on_paste(event):
+        try:
+            text = entry.clipboard_get()
+        except tk.TclError:
+            return None  # 클립보드가 비었거나 글이 아님: 기본 동작에 맡김
+        if text.splitlines() == [text]:
+            return None
+        if entry.selection_present():
+            entry.icursor("sel.first")
+            entry.delete("sel.first", "sel.last")
+        entry.insert("insert", flatten_lines(text))
+        entry.xview("insert")
+        if after_paste:
+            after_paste()
+        return "break"
+    entry.bind("<<Paste>>", on_paste)
+
+
+def split_title_and_memo(text):
+    """여러 줄 글을 (제목, 메모)로 나눔: 첫 번째 비어 있지 않은 줄이 제목, 나머지가 메모.
+    메모는 줄바꿈을 그대로 두되 앞뒤의 빈 줄과 줄 끝 공백은 지움. 한 줄이면 메모는 빈 문자열."""
+    lines = text.splitlines()
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    if not lines:
+        return "", ""
+    memo = "\n".join(line.rstrip() for line in lines[1:])
+    memo = re.sub(r"\A(?:[ \t]*\n)+", "", memo).rstrip()
+    return lines[0].strip(), memo
 
 
 # ---- 휴지통 (trash.json) ----
@@ -1045,6 +1180,15 @@ def flush_to_disk(f):
         os.fsync(f.fileno())
     except OSError as e:
         log_message(f"fsync 실패(무시함): {e}")
+
+
+UNTITLED_LABEL = "(제목 없음)"
+
+
+def display_title(title):
+    """목록/검색 결과/휴지통 창에 보여줄 메모 제목: 비어 있거나 공백뿐이면 "(제목 없음)".
+    화면에 보이는 글만 바꾸며, 저장되는 제목이나 제목 입력칸은 그대로임."""
+    return title if title.strip() else UNTITLED_LABEL
 
 
 def text_or(value, default=""):
@@ -1768,15 +1912,12 @@ class SettingsManager:
             "Alt+Shift+C": "<Alt-Shift-C>"
         }
         binding = shortcut_map.get(self.copy_shortcut, "<Control-Shift-C>")
-        self.app.root.bind(binding, self.app.copy_to_clipboard)
+        bind_letter_shortcut(self.app.root, binding, self.app.copy_to_clipboard)
 
     def unbind_copy_shortcut(self):
         """모든 복사 단축키 바인딩 제거"""
         for seq in ("<Control-Shift-C>", "<Control-Alt-c>", "<Alt-Shift-C>"):
-            try:
-                self.app.root.unbind(seq)
-            except Exception:
-                pass
+            unbind_letter_shortcut(self.app.root, seq)
 
     def open_font_settings(self):
         settings_win = Toplevel(self.app.root)
@@ -1950,6 +2091,7 @@ class SettingsManager:
                 row=row, column=0, padx=(10, 5), pady=4, sticky="w"
             )
             entry = ttk.Entry(settings_win, width=40, font=UI_FONT)
+            bind_single_line_paste(entry)  # 여러 줄을 붙여넣어도 문구에 줄바꿈이 저장되지 않게 함
             entry.insert(0, self.quick_inputs.get(key, ""))
             entry.grid(row=row, column=1, padx=(0, 10), pady=4, sticky="ew")
             entries[key] = entry
@@ -2039,7 +2181,8 @@ class GeneralMemoTab:
         self.title_entry = ttk.Entry(right_panel, font=UI_FONT)
         self.title_entry.pack(fill=tk.X, pady=(0, 10))
         self.title_entry.bind("<KeyRelease>", self.update_memo_realtime)
-        self.title_entry.bind("<Control-t>", self.app.focus_on_title)
+        bind_single_line_paste(self.title_entry, self.update_memo_realtime)  # 여러 줄은 한 줄로 합쳐 넣음
+        bind_letter_shortcut(self.title_entry, "<Control-t>", self.app.focus_on_title)
 
         content_label = ttk.Label(right_panel, text="메모 내용", font=UI_FONT)
         content_label.pack(anchor="w")
@@ -2051,9 +2194,9 @@ class GeneralMemoTab:
         self.content_text.pack(fill=tk.BOTH, expand=True)
         self.content_text.bind("<KeyRelease>", lambda event: self.update_memo_realtime(event, update_list=False))
         self.content_text.bind("<ButtonRelease-1>", self.app.update_status_bar)
-        self.content_text.bind("<Control-t>", self.app.focus_on_title)
+        bind_letter_shortcut(self.content_text, "<Control-t>", self.app.focus_on_title)
         # Tk Text의 기본 Ctrl+F(커서를 한 칸 앞으로)가 먼저 실행되지 않도록 여기서 가로챔
-        self.content_text.bind("<Control-f>", self.app.focus_search)
+        bind_letter_shortcut(self.content_text, "<Control-f>", self.app.focus_search)
 
         # 복사 버튼과 복사 완료 메시지를 위한 프레임
         copy_frame = ttk.Frame(right_panel)
@@ -2179,7 +2322,7 @@ class GeneralMemoTab:
                 self.title_entry.delete("sel.first", "sel.last")
             except tk.TclError:
                 pass
-            self.title_entry.insert(tk.INSERT, text)
+            self.title_entry.insert(tk.INSERT, to_single_line(text))  # 빠른 입력 문구에 줄바꿈이 있어도 한 줄로
             self.update_memo_realtime(update_list=True)
             return True
         if widget is self.content_text:
@@ -2212,7 +2355,7 @@ class GeneralMemoTab:
 
         self.listbox.delete(0, tk.END)
         for memo in self.memos:
-            self.listbox.insert(tk.END, memo["title"])
+            self.listbox.insert(tk.END, display_title(memo["title"]))
 
         if top is not None and self.listbox.size():
             self.listbox.yview(max(0, min(top + top_adjust, self.listbox.size() - 1)))
@@ -2355,7 +2498,7 @@ class GeneralMemoTab:
             # 전체 delete(0, END)+재삽입 대신, 바뀐 항목 하나만 갱신
             # (다른 항목은 그대로라 스크롤 위치도 자연히 유지됨)
             self.listbox.delete(self.current_index)
-            self.listbox.insert(self.current_index, title)
+            self.listbox.insert(self.current_index, display_title(title))
             self.listbox.selection_set(self.current_index)
             # delete+insert 때문에 활성(active) 항목이 한 칸 뒤로 밀리면, 이후 목록에서
             # ↓를 눌렀을 때 한 행을 건너뛰므로 편집 중인 행으로 되돌림
@@ -2500,7 +2643,7 @@ class GeneralMemoTab:
             if not text_matches_terms(f"{title}\n{content}".lower(), terms):
                 continue
             results.append({
-                "where": title or "(제목 없음)",
+                "where": display_title(title),
                 "text": make_search_snippet(content, terms),
                 # 메모에는 id가 없어서, 검색한 시점의 메모 내용(memo)을 함께 기억해 두었다가
                 # 이동할 때 그 자리에 아직 같은 메모가 있는지 확인함
@@ -2536,7 +2679,7 @@ class GeneralMemoTab:
         """휴지통 창에 보여줄 위치/내용 요약/전체 내용"""
         title = text_or(entry["data"].get("title"))
         content = text_or(entry["data"].get("content"))
-        return {"where": title or "(제목 없음)", "text": make_search_snippet(content, []),
+        return {"where": display_title(title), "text": make_search_snippet(content, []),
                 "detail": f"제목: {title}\n\n{content}"}
 
     def trash_restore(self, entry):
@@ -2581,6 +2724,9 @@ class CalendarMemoTab:
         self.cal_year, self.cal_month = now.year, now.month
         self.cal_year_year = now.year
         self.selected_date = self._today_str()
+        # 편집창의 내용을 모두 지워서 메모가 사라진 경우 (날짜, 지우기 직전 내용). 날짜를 옮기거나 탭을
+        # 벗어나는 등 확정되는 시점에 휴지통으로 보관함 (_flush_cleared_memo 참고)
+        self._cleared_memo = None
         # 1년전체보기: 각 월의 1일이 있는 주(行) 번호 {월: 행} - render_year_view가 채움. 서브탭을 열 때
         # 조회하던 월 위치로 스크롤하거나(_scroll_year_view_to_month) 월 숫자 클릭을 처리하는 데 씀
         self._year_month_rows = {}
@@ -2758,8 +2904,13 @@ class CalendarMemoTab:
             "<Configure>",
             lambda e: self.year_canvas.configure(scrollregion=self.year_canvas.bbox("all"))
         )
-        self.year_canvas.bind("<Enter>", lambda e: self.year_canvas.bind_all("<MouseWheel>", self._on_year_mousewheel))
-        self.year_canvas.bind("<Leave>", lambda e: self.year_canvas.unbind_all("<MouseWheel>"))
+        # 마우스 휠: 캔버스의 <Enter>/<Leave>로 전역 바인딩을 걸고 풀면, 포인터가 캔버스 안의 날짜 칸(자식
+        # 위젯)으로 들어갈 때도 <Leave>가 발생해 날짜 칸 위에서는 휠이 멈추고, unbind_all은 다른 곳의 휠
+        # 바인딩까지 지움. 그래서 전역 바인딩을 한 번만 걸어 두고(add="+"), 핸들러가 포인터가 1년전체보기
+        # 영역(날짜 칸, 스크롤바 포함) 위에 있을 때만 동작하게 함
+        self._year_scroll_container = y_scroll_container
+        self._year_wheel_remainder = 0  # 아직 한 칸으로 채우지 못한 휠 이동량 (정밀 휠/터치패드용)
+        self.year_canvas.bind_all("<MouseWheel>", self._on_year_mousewheel, add="+")
 
         # -- 목록보기 (달력 그리드 대신, 메모가 있는 날짜만 목록으로 보여줌) --
         # 추가/제거/이전/다음 버튼은 위의 공용 cal_nav_buttons에만 있고, 이 서브탭에는 목록과
@@ -2816,7 +2967,11 @@ class CalendarMemoTab:
         self.date_content_text.bind("<Prior>", self.app._on_prior_key)
         self.date_content_text.bind("<Next>", self.app._on_next_key)
         # Tk Text의 기본 Ctrl+F(커서를 한 칸 앞으로)가 먼저 실행되지 않도록 여기서 가로챔
-        self.date_content_text.bind("<Control-f>", self.app.focus_search)
+        bind_letter_shortcut(self.date_content_text, "<Control-f>", self.app.focus_search)
+        # Tk Text의 기본 Ctrl+T(커서 앞뒤 두 글자를 서로 바꿈)가 먼저 실행되지 않도록 가로챔. 위젯 클래스
+        # 바인딩은 root 바인딩보다 먼저 실행되므로, 여기서 막지 않으면 오늘 날짜를 보는 중에 Ctrl+T(오늘로
+        # 이동)를 누를 때 글자가 바뀌고 그 내용이 그대로 저장됨. (일반메모 내용창과 같은 처리)
+        bind_letter_shortcut(self.date_content_text, "<Control-t>", self.app.focus_on_title)
 
         date_copy_frame = ttk.Frame(cal_right)
         date_copy_frame.pack(anchor="e", pady=5)
@@ -3075,8 +3230,32 @@ class CalendarMemoTab:
             m = self.cal_month
         self.go_to_month(self.cal_year, m)
 
+    def _pointer_over_year_view(self, event):
+        """마우스 포인터가 1년전체보기 영역(캔버스, 날짜 칸, 스크롤바) 위에 있는지"""
+        try:
+            widget = self.year_canvas.winfo_containing(event.x_root, event.y_root)
+        except (KeyError, tk.TclError):  # 콤보박스 팝업 등 이름으로 찾을 수 없는 위젯
+            return False
+        while widget is not None:
+            if widget is self._year_scroll_container:
+                return True
+            widget = getattr(widget, "master", None)
+        return False
+
     def _on_year_mousewheel(self, event):
-        self.year_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        """1년전체보기 위에서 마우스 휠로 스크롤함. 휠 한 칸은 delta 120인데, 정밀 휠/터치패드는 120보다
+        작은 값을 여러 번 보내므로 int(delta / 120)처럼 바로 자르면 0이 되어 스크롤이 안 됨. 이동량을
+        모아 두었다가 120이 찰 때마다 한 칸씩 스크롤함."""
+        if not event.delta or not self._pointer_over_year_view(event):
+            return None
+        if self._year_wheel_remainder * event.delta < 0:
+            self._year_wheel_remainder = 0  # 휠 방향이 바뀌면 이전 방향의 남은 양은 버림
+        self._year_wheel_remainder += event.delta
+        notches = int(self._year_wheel_remainder / 120)
+        if notches:
+            self._year_wheel_remainder -= notches * 120
+            self.year_canvas.yview_scroll(-notches, "units")
+        return None
 
     def go_to_month(self, year, month):
         while month < 1:
@@ -3114,6 +3293,8 @@ class CalendarMemoTab:
         선택되어 있고 메모 유무도 바뀌지 않으므로 목록을 다시 그릴 필요가 없음."""
         if normalize_date_key(date_key) is None:
             return  # 지원 연도(CAL_MIN_YEAR~CAL_MAX_YEAR) 밖의 흐린 날짜 칸
+        # 다른 날짜로 옮기기 전에, 내용을 모두 지워 사라진 메모가 있으면 휴지통에 보관함
+        moved_to_trash = self._flush_cleared_memo()
         prev_selected = self.selected_date
         prev_month_view = (self.cal_year, self.cal_month)
         prev_year_view = self.cal_year_year
@@ -3143,6 +3324,8 @@ class CalendarMemoTab:
             # 새로 그린 해가 1월이 아니라 그 날짜의 달 위치에 오게 함
             self._schedule_year_scroll(self.cal_month)
         self.app.update_status_bar()
+        if moved_to_trash:
+            self.app.show_status_message("내용을 모두 지운 메모를 휴지통으로 옮겼습니다. (복원: Ctrl+Shift+X)")
 
     def go_to_adjacent_memo_date(self, direction):
         """[◀이전]/[다음▶] 버튼 및 PageUp(-1)/PageDown(+1): 메모가 있는 날짜 중 현재 선택된
@@ -3232,8 +3415,14 @@ class CalendarMemoTab:
             return
         if new_value is not None:
             self.calendar_memos[self.selected_date] = new_value
+            if self._cleared_memo and self._cleared_memo[0] == self.selected_date:
+                self._cleared_memo = None  # 지웠다가 다시 쓰거나 실행취소로 되살림: 일반 편집으로 봄
         else:
-            self.calendar_memos.pop(self.selected_date, None)
+            previous = self.calendar_memos.pop(self.selected_date, None)
+            if previous is not None and previous.strip():
+                # 내용을 모두 지우면 이 날짜의 메모가 사라지므로, [제거]/Ctrl+D와 같이 휴지통에 보관함.
+                # (키를 누를 때마다 휴지통 파일을 쓰지 않도록 보관은 날짜를 옮길 때 등으로 미룸)
+                self._cleared_memo = (self.selected_date, previous)
         self._update_remove_date_memo_button_state()
         self.app._debounced_save("calendar_memos", self.app.save_calendar_memos)
         # 달력 칸의 진한 배경색은 "메모 있음" 여부가 바뀔 때(빈 날짜에 처음 쓰거나 마지막
@@ -3242,6 +3431,31 @@ class CalendarMemoTab:
         if had_memo != bool(content.strip()):
             self.app._debounced_save("calendar_view_refresh", self._refresh_calendar_views)
         self.app.update_status_bar()
+
+    def _flush_cleared_memo(self):
+        """내용을 모두 지워서 사라진 메모(_cleared_memo)가 있으면 휴지통에 보관함. 그 사이 같은 날짜에 다시
+        내용이 생겼으면 일반 편집이므로 아무것도 안 함. 휴지통에 보관하지 못했고 사용자가 삭제를 취소했으면
+        지운 내용을 되돌림. 휴지통으로 옮겼으면 True를 반환함."""
+        pending, self._cleared_memo = self._cleared_memo, None
+        if not pending:
+            return False
+        date_key, content = pending
+        if self.calendar_memos.get(date_key, "").strip():
+            return False
+        if self.app.trash_add("calendar_memo", {"date": date_key, "content": content}):
+            return True
+        self.calendar_memos[date_key] = content
+        if date_key == self.selected_date:
+            set_text_content(self.date_content_text, content)
+            self._update_remove_date_memo_button_state()
+        self.app.save_calendar_memos()
+        self._refresh_calendar_views()
+        return False
+
+    def on_deactivated(self, event=None):
+        """다른 탭으로 옮기거나, 휴지통 열기/백업/가져오기/복원/종료처럼 데이터를 건드리기 직전에 호출됨
+        (MemoApp._commit_inline_edits): 내용을 모두 지워 삭제된 메모를 휴지통에 보관함"""
+        self._flush_cleared_memo()
 
     def _update_remove_date_memo_button_state(self):
         """[제거] 버튼(공용 하단 행의 [추가]/[제거]/[◀이전]/[다음▶] 중 하나)을 현재
@@ -4193,7 +4407,7 @@ class EditItemDialog(tk.Toplevel):
         title_entry.select_range(0, "end")
 
     def _save(self):
-        title = self.title_var.get().strip()
+        title = flatten_lines(self.title_var.get())  # 제목 칸에 여러 줄을 붙여넣어도 한 줄로 저장
         url = self.url_var.get().strip()
         memo = self.memo_text.get("1.0", "end-1c").strip()
         if not url and not title and not memo:
@@ -4865,7 +5079,7 @@ class ChecklistTab:
     # ==================== 항목 추가 ====================
 
     def _on_add_submit(self, event=None):
-        raw = self.add_entry.get().strip()
+        raw = flatten_lines(self.add_entry.get())  # 여러 줄을 붙여넣었으면 한 줄로 합침 (flatten_lines 참고)
         if not raw:
             return "break"
         fid = self._get_selected_folder_id()
@@ -4931,12 +5145,12 @@ class ChecklistTab:
         self._refresh_items(select_item_id=select_item_id)
 
     def _new_folder(self):
-        name = simpledialog.askstring("새 폴더", "폴더 이름을 입력하세요:", parent=self.app.root)
-        if name and name.strip():
+        name = flatten_lines(simpledialog.askstring("새 폴더", "폴더 이름을 입력하세요:", parent=self.app.root) or "")
+        if name:
             current_id = self._get_selected_folder_id()
-            new_folder = self._add_folder(name.strip(), after_id=current_id)
+            new_folder = self._add_folder(name, after_id=current_id)
             self._refresh_folders(select_id=new_folder["id"])
-            self.app.show_status_message(f"'{name.strip()}' 폴더를 만들었습니다.")
+            self.app.show_status_message(f"'{name}' 폴더를 만들었습니다.")
         # simpledialog(모달 Toplevel)가 닫힌 뒤 포커스가 유실되는 문제 방지 (취소 시에도 동일 적용)
         self.folder_listbox.focus_set()
 
@@ -4946,10 +5160,10 @@ class ChecklistTab:
             messagebox.showinfo("알림", "이름을 변경할 폴더를 선택해주세요.", parent=self.app.root)
             return
         folder = self._get_folder(fid)
-        new_name = simpledialog.askstring(
-            "폴더 이름 변경", "새 이름을 입력하세요:", initialvalue=folder["name"], parent=self.app.root)
-        if new_name and new_name.strip():
-            self._rename_folder_data(fid, new_name.strip())
+        new_name = flatten_lines(simpledialog.askstring(
+            "폴더 이름 변경", "새 이름을 입력하세요:", initialvalue=folder["name"], parent=self.app.root) or "")
+        if new_name:
+            self._rename_folder_data(fid, new_name)
             self._refresh_folders()
         self.folder_listbox.focus_set()
 
@@ -5278,7 +5492,7 @@ class ChecklistTab:
         # (<<ListboxSelect>> -> _refresh_items) 그 안에서 편집이 확정되므로, 확정 시점의 선택
         # 폴더로 항목을 찾으면 엉뚱한 폴더를 뒤져 편집이 버려짐. 그래서 시작한 폴더 id로 찾음
         edit_fid = self._inline_edit_folder_id
-        new_value = self._inline_editor.get().strip()
+        new_value = flatten_lines(self._inline_editor.get())
         editor = self._inline_editor
         # 편집창(Entry)이 사라지기 전, 아직 그 안에 포커스가 있었는지 기억해둠 (컬렉션
         # 탭과 동일한 이유 - Enter로 편집을 마치면 그렇지만, 다른 위젯을 클릭해서
@@ -5659,6 +5873,8 @@ class CollectionTab:
         self.context_menu.add_command(label="열기", command=self._open_selected_item)
         self.context_menu.add_command(label="편집...", command=self._edit_selected_item)
         self.context_menu.add_command(label="제목 바로 수정", command=self._start_inline_edit_for_selected_item)
+        self.context_menu.add_command(label="제목 다시 가져오기", command=self._retry_title_fetch_for_selected_item)
+        self._retry_menu_index = self.context_menu.index(tk.END)  # 항목에 따라 켜고 끄기 위해 위치를 기억함
         self.context_menu.add_separator()
         self.context_menu.add_command(label="삭제", command=self._delete_selected_item)
 
@@ -6003,7 +6219,9 @@ class CollectionTab:
         return bool(match and match.group("tld").lower() in self._BARE_DOMAIN_TLDS)
 
     def _on_add_submit(self, event=None):
-        raw = self.add_entry.get().strip()
+        # 여러 줄을 붙여넣으면 첫 줄이 제목(URL처럼 보이면 링크), 나머지 줄이 메모가 됨. 한 줄이면 전과 같음.
+        # (줄바꿈이 제목에 그대로 들어가면 목록 행과 복사/내보내기 양식이 깨지므로 제목은 항상 한 줄)
+        raw, memo = split_title_and_memo(self.add_entry.get())
         if not raw:
             return "break"
         cid = self._get_selected_collection_id()
@@ -6011,10 +6229,10 @@ class CollectionTab:
             messagebox.showinfo("컬렉션 선택", "먼저 왼쪽에서 컬렉션을 선택하거나 새로 만들어주세요.", parent=self.app.root)
             return "break"
         if self._looks_like_url(raw):
-            self._add_item_from_url(raw)
+            self._add_item_from_url(raw, memo=memo)
         else:
             after_id = self._get_selected_item_id()
-            item = self._add_item_data(cid, title=raw, url="", memo="", after_id=after_id)
+            item = self._add_item_data(cid, title=raw, url="", memo=memo, after_id=after_id)
             if item:
                 self._update_collection_label(cid)
                 self._refresh_items(select_item_id=item["id"])
@@ -6022,7 +6240,7 @@ class CollectionTab:
         self.add_entry.delete(0, tk.END)
         return "break"
 
-    def _add_item_from_url(self, raw_url):
+    def _add_item_from_url(self, raw_url, memo=""):
         cid = self._get_selected_collection_id()
         if not cid:
             return
@@ -6030,7 +6248,7 @@ class CollectionTab:
         if not url:
             return
         after_id = self._get_selected_item_id()
-        item = self._add_item_data(cid, title=url, url=url, memo="", after_id=after_id)
+        item = self._add_item_data(cid, title=url, url=url, memo=memo, after_id=after_id)
         if not item:
             return
         self._update_collection_label(cid)
@@ -6040,6 +6258,39 @@ class CollectionTab:
         self.app.show_status_message(f"제목을 가져오는 중입니다... ({url})")
         self.fetcher.fetch_async(url, request_id)
         self._start_polling()
+
+    # ---- 제목 다시 가져오기 ----
+
+    @staticmethod
+    def _has_default_title(item):
+        """제목이 아직 URL 그대로(또는 비어 있음)인가. 항목을 URL로 추가하면 제목이 URL로 시작하고,
+        가져오기에 성공하면 페이지 제목으로 바뀌므로, 이 상태가 "제목을 못 가져왔다"는 뜻임.
+        (사용자가 직접 고친 제목은 가져온 제목으로 덮어쓰지 않으려고 구분하는 기준이기도 함)"""
+        return (item.get("title") or "") in ("", item.get("url"))
+
+    def _can_retry_title_fetch(self, item):
+        """웹 주소가 있고 제목을 아직 못 가져온(기본 제목 그대로인) 항목이며, 지금 가져오는 중이 아닌가"""
+        return bool(item and is_web_url(item.get("url") or "") and self._has_default_title(item)
+                    and item["id"] not in self._pending_fetches)
+
+    def _retry_title_fetch_for_selected_item(self):
+        """우클릭 > 제목 다시 가져오기: 선택한 항목의 제목을 다시 가져옴. 가져오기에 실패했던(제목이 URL
+        그대로인) 항목만 대상이며, 직접 고친 제목은 바꾸지 않음."""
+        cid = self._get_selected_collection_id()
+        item = self._find_item(cid, self._get_selected_item_id()) if cid else None
+        if item is None:
+            return
+        if not is_web_url(item.get("url") or ""):
+            self.app.show_status_message("웹 주소(http/https)가 있는 항목만 제목을 가져올 수 있습니다.")
+        elif not self._has_default_title(item):
+            self.app.show_status_message("이미 제목이 있는 항목입니다. 제목을 가져오지 못한 항목만 다시 가져옵니다.")
+        elif item["id"] in self._pending_fetches:
+            self.app.show_status_message("이미 제목을 가져오는 중입니다.")
+        else:
+            self._pending_fetches[item["id"]] = cid
+            self.app.show_status_message(f"제목을 다시 가져오는 중입니다... ({item['url']})")
+            self.fetcher.fetch_async(item["url"], item["id"])
+            self._start_polling()
 
     # ---- 백그라운드 제목 수집 결과 폴링 ----
 
@@ -6067,7 +6318,7 @@ class CollectionTab:
                 item = self._find_item(cid, request_id)
                 if item is None:
                     continue
-                if msg.get("title") and item.get("title") != item.get("url"):
+                if msg.get("title") and not self._has_default_title(item):
                     # 항목을 추가할 때의 제목은 URL 자체임. 가져오는 동안 제목을 직접 고쳤거나 URL을
                     # 바꿨다면(제목 != URL) 사용자의 편집을 가져온 제목으로 덮어쓰지 않음
                     self.app.show_status_message("제목을 직접 수정한 항목이라 가져온 제목은 적용하지 않았습니다.")
@@ -6078,7 +6329,8 @@ class CollectionTab:
                     self._update_item_row(cid, request_id)
                     self.app.show_status_message(f"제목을 가져왔습니다: {msg['title']}")
                 elif msg.get("error"):
-                    self.app.show_status_message(f"제목 가져오기 실패: {msg['error']}")
+                    hint = " (우클릭 > 제목 다시 가져오기)" if self._can_retry_title_fetch(item) else ""
+                    self.app.show_status_message(f"제목 가져오기 실패: {msg['error']}{hint}")
         except queue.Empty:
             pass
         # 대기 중인 요청이 남아있는 동안만 폴링을 이어감 (없으면 멈춰서 불필요한
@@ -6141,12 +6393,12 @@ class CollectionTab:
         self._refresh_items(select_item_id=select_item_id)
 
     def _new_collection(self):
-        name = simpledialog.askstring("새 컬렉션", "컬렉션 이름을 입력하세요:", parent=self.app.root)
-        if name and name.strip():
+        name = flatten_lines(simpledialog.askstring("새 컬렉션", "컬렉션 이름을 입력하세요:", parent=self.app.root) or "")
+        if name:
             current_id = self._get_selected_collection_id()
-            new_col = self._add_collection(name.strip(), after_id=current_id)
+            new_col = self._add_collection(name, after_id=current_id)
             self._refresh_collections(select_id=new_col["id"])
-            self.app.show_status_message(f"'{name.strip()}' 컬렉션을 만들었습니다.")
+            self.app.show_status_message(f"'{name}' 컬렉션을 만들었습니다.")
         # simpledialog(모달 Toplevel)가 닫힌 뒤에는 키보드 포커스가 돌아오지 않아 방향키로 목록을
         # 탐색할 수 없으므로 목록에 포커스를 명시적으로 되돌림 (취소했을 때도 동일)
         self.collection_listbox.focus_set()
@@ -6157,10 +6409,10 @@ class CollectionTab:
             messagebox.showinfo("알림", "이름을 변경할 컬렉션을 선택해주세요.", parent=self.app.root)
             return
         col = self._get_collection(cid)
-        new_name = simpledialog.askstring(
-            "컬렉션 이름 변경", "새 이름을 입력하세요:", initialvalue=col["name"], parent=self.app.root)
-        if new_name and new_name.strip():
-            self._rename_collection_data(cid, new_name.strip())
+        new_name = flatten_lines(simpledialog.askstring(
+            "컬렉션 이름 변경", "새 이름을 입력하세요:", initialvalue=col["name"], parent=self.app.root) or "")
+        if new_name:
+            self._rename_collection_data(cid, new_name)
             self._refresh_collections()
         # simpledialog가 닫힌 뒤 포커스가 유실되지 않도록 목록에 되돌림
         # (F2로 이름 변경한 뒤 바로 위/아래로 다른 컬렉션을 탐색할 수 있어야 함)
@@ -6440,7 +6692,14 @@ class CollectionTab:
         if iid:
             self.items_tree.selection_set(iid)
             self.items_tree.focus(iid)
+            self._update_context_menu_state(iid)
             self.context_menu.tk_popup(event.x_root, event.y_root)
+
+    def _update_context_menu_state(self, item_id):
+        """우클릭한 항목에 맞게 메뉴를 켜고 끔: [제목 다시 가져오기]는 제목을 못 가져온 항목에서만 켬"""
+        item = self._find_item(self._get_selected_collection_id(), item_id)
+        can_retry = self._can_retry_title_fetch(item)
+        self.context_menu.entryconfig(self._retry_menu_index, state="normal" if can_retry else "disabled")
 
     def _on_item_press(self, event):
         self._item_drag_id = self.items_tree.identify_row(event.y)
@@ -6600,7 +6859,7 @@ class CollectionTab:
         # (<<ListboxSelect>> -> _refresh_items) 그 안에서 편집이 확정되므로, 확정 시점의 선택
         # 컬렉션으로 항목을 찾으면 엉뚱한 컬렉션을 뒤져 편집이 버려짐. 그래서 시작한 컬렉션 id로 찾음
         edit_cid = self._inline_edit_collection_id
-        new_value = self._inline_editor.get().strip()
+        new_value = flatten_lines(self._inline_editor.get())
         editor = self._inline_editor
         # 편집창(Entry)이 사라지기 전, 아직 그 안에 포커스가 있었는지 기억해둠. Enter로
         # 편집을 마친 경우엔 그렇지만, 다른 위젯(예: 컬렉션 목록)을 클릭해서 FocusOut으로
@@ -7128,7 +7387,7 @@ class TrashDialog(tk.Toplevel):
         self.tree.bind("<Return>", self._restore_selected)
         self.tree.bind("<KP_Enter>", self._restore_selected)
         self.tree.bind("<Delete>", self._purge_selected)
-        self.tree.bind("<Control-a>", self._select_all)
+        bind_letter_shortcut(self.tree, "<Control-a>", self._select_all)
         self.tree.bind("<Double-1>", self._on_double_click)
         self.bind("<Escape>", lambda e: self.destroy())
         self.bind("<Destroy>", self._on_destroy)
@@ -7352,6 +7611,7 @@ class HolidayEditorDialog(tk.Toplevel):
         self.date_entry.pack(side=tk.LEFT, padx=(0, 10))
         ttk.Label(edit, text="이름", font=UI_FONT).pack(side=tk.LEFT, padx=(0, 4))
         self.name_entry = ttk.Entry(edit, font=UI_FONT)
+        bind_single_line_paste(self.name_entry)  # 여러 줄을 붙여넣어도 이름에 줄바꿈이 저장되지 않게 함
         self.name_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
         ttk.Button(edit, text="추가 / 수정", command=self._apply_entry).pack(side=tk.LEFT)
         self.delete_button = ttk.Button(edit, text="삭제", command=self._delete_selected)
@@ -7375,10 +7635,11 @@ class HolidayEditorDialog(tk.Toplevel):
 
         self.tree.bind("<<TreeviewSelect>>", lambda e: self._on_select())
         self.tree.bind("<Delete>", lambda e: self._delete_selected())
-        self.tree.bind("<Control-a>", lambda e: (self.tree.selection_set(self.tree.get_children()), "break")[1])
+        bind_letter_shortcut(self.tree, "<Control-a>",
+                             lambda e: (self.tree.selection_set(self.tree.get_children()), "break")[1])
         for entry in (self.date_entry, self.name_entry):
             entry.bind("<Return>", lambda e: (self._apply_entry(), "break")[1])
-        self.bind("<Control-s>", lambda e: (self._save(), "break")[1])
+        bind_letter_shortcut(self, "<Control-s>", lambda e: (self._save(), "break")[1])
         self.bind("<Escape>", lambda e: self._close())
         self.protocol("WM_DELETE_WINDOW", self._close)
         self.bind("<Destroy>", self._on_destroy)
@@ -7749,6 +8010,7 @@ class MemoApp:
         self.create_menu()
 
         # ---- 단축키 등록 ----
+        # (영문자 단축키는 Caps Lock이 켜져 있어도 동작하도록 bind_letter_shortcut으로 건다)
         # 아래는 전부 root 레벨에 한 번만 바인딩하고, 실제 동작은 그 순간의 활성
         # 탭(self._active_tab())에게 위임한다. 각 라우터 메서드는 활성 탭에 해당
         # 이름의 메서드가 있으면 호출하고 없으면 조용히 넘어가므로, 새 탭이
@@ -7757,16 +8019,16 @@ class MemoApp:
         self.root.bind("<Control-Shift-Tab>", lambda event: self._cycle_top_tab(-1))
 
         # 공통 단축키 (탭마다 의미가 다름 - 각 라우터 메서드 주석 참고)
-        self.root.bind("<Control-n>", self._on_ctrl_n_key)
-        self.root.bind("<Control-d>", self._on_ctrl_d_key)
+        bind_letter_shortcut(self.root, "<Control-n>", self._on_ctrl_n_key)
+        bind_letter_shortcut(self.root, "<Control-d>", self._on_ctrl_d_key)
         self._install_ctrl_d_guard()
-        self.root.bind("<Control-m>", self._on_ctrl_m_key)
-        self.root.bind("<Control-l>", self.focus_on_listbox)
-        self.root.bind("<Control-t>", self.focus_on_title)
-        self.root.bind("<Control-f>", self.focus_search)
+        bind_letter_shortcut(self.root, "<Control-m>", self._on_ctrl_m_key)
+        bind_letter_shortcut(self.root, "<Control-l>", self.focus_on_listbox)
+        bind_letter_shortcut(self.root, "<Control-t>", self.focus_on_title)
+        bind_letter_shortcut(self.root, "<Control-f>", self.focus_search)
         self.root.bind("<Prior>", self._on_prior_key)
         self.root.bind("<Next>", self._on_next_key)
-        self.root.bind("<Alt-t>", self.insert_datetime)
+        bind_letter_shortcut(self.root, "<Alt-t>", self.insert_datetime)
         # 빠른 입력 단축키 (Alt+1 ~ Alt+9, Alt+0)
         # Windows에서는 <Alt-1>처럼 특정 숫자 keysym을 그대로 bind()하면
         # WM_SYSKEYDOWN 처리 특성상 이벤트가 씹혀 동작하지 않는 경우가 있어,
@@ -7774,17 +8036,17 @@ class MemoApp:
         self.root.bind("<Alt-KeyPress>", self._on_alt_number_keypress)
 
         # 탭 전용 단축키 (구현한 탭이 활성화되어 있을 때만 동작함)
-        self.root.bind("<Alt-m>", self._on_alt_m_key)
-        self.root.bind("<Alt-y>", self._on_alt_y_key)
-        self.root.bind("<Alt-l>", self._on_alt_l_key)
-        self.root.bind("<Alt-h>", self._on_alt_h_key)
+        bind_letter_shortcut(self.root, "<Alt-m>", self._on_alt_m_key)
+        bind_letter_shortcut(self.root, "<Alt-y>", self._on_alt_y_key)
+        bind_letter_shortcut(self.root, "<Alt-l>", self._on_alt_l_key)
+        bind_letter_shortcut(self.root, "<Alt-h>", self._on_alt_h_key)
         self.root.bind("<Alt-Left>", self._on_alt_left_key)
         self.root.bind("<Alt-Right>", self._on_alt_right_key)
         # 고급 사용자용 숨김 기능: 버튼 없이 단축키로만 진입 (달력메모 탭 전용)
-        self.root.bind("<Control-Shift-D>", self._on_ctrl_shift_d_key)
-        self.root.bind("<Control-Shift-N>", self._on_ctrl_shift_n_key)
-        self.root.bind("<Control-Shift-X>", self.open_trash)
-        self.root.bind("<Control-Shift-H>", self._on_ctrl_shift_h_key)
+        bind_letter_shortcut(self.root, "<Control-Shift-D>", self._on_ctrl_shift_d_key)
+        bind_letter_shortcut(self.root, "<Control-Shift-N>", self._on_ctrl_shift_n_key)
+        bind_letter_shortcut(self.root, "<Control-Shift-X>", self.open_trash)
+        bind_letter_shortcut(self.root, "<Control-Shift-H>", self._on_ctrl_shift_h_key)
         self.root.bind("<F2>", self._on_f2_key)
         self.root.bind("<F1>", self._show_shortcut_help)
 
@@ -8798,7 +9060,7 @@ class MemoApp:
                 if isinstance(child, tk.Toplevel):
                     continue
                 if child.winfo_class() in self._CTRL_D_GUARD_CLASSES:
-                    child.bind("<Control-d>", guard)
+                    bind_letter_shortcut(child, "<Control-d>", guard)
                 walk(child)
 
         walk(self.root)
@@ -8989,6 +9251,7 @@ class MemoApp:
                 return
         # 2) 컬렉션/체크리스트 탭에 열려 있는 인라인 편집이 있다면 커밋 후 저장함
         #    (컬렉션의 백그라운드 제목 수집 폴링은 종료가 확정된 뒤에 멈춤)
+        self.calendar_tab.on_deactivated()  # 내용을 모두 지운 달력메모는 휴지통에 보관
         self.collection_tab.on_deactivated()
         self.checklist_tab.on_deactivated()
         # 3) 종료 전 설정 및 메모 저장 (창 크기, 위치 포함)
