@@ -133,6 +133,68 @@ def set_windows_app_id(app_id="alpaca.diary"):
         pass
 
 
+# ---- 화면 배율(DPI) 대응 ---------------------------------------------------------------------
+# True면 프로그램이 Windows 화면 배율(125%, 150% 등)을 직접 처리해 글자가 선명하게 보임.
+# False면 예전처럼 Windows가 창을 비트맵으로 늘려 그려 주므로 높은 배율에서 글자가 흐릿해짐.
+# 켠 뒤에 화면이 어색하게 보이는 PC가 있으면 False로 바꿔 다시 만들면 이전 동작으로 돌아감.
+ENABLE_DPI_AWARENESS = True
+# 현재 화면 배율 (1.0 = 100%, 1.5 = 150%). MemoApp이 시작할 때 init_dpi_scale()로 정함.
+# 100%에서는 px()가 값을 그대로 돌려주므로, 배율이 100%인 PC의 화면은 이전과 똑같음.
+DPI_SCALE = 1.0
+# sv_ttk 테마가 만드는 글꼴의 100% 기준 크기(픽셀). sv_ttk는 글꼴을 픽셀 단위로 만들어 화면 배율이
+# 반영되지 않으므로(버튼/입력칸/목록 제목만 작게 보임), 배율만큼 직접 키움 (scale_sv_ttk_fonts 참고)
+SV_TTK_FONT_PIXELS = {
+    "SunValleyCaptionFont": 12, "SunValleyBodyFont": 14, "SunValleyBodyStrongFont": 14,
+    "SunValleyBodyLargeFont": 18, "SunValleySubtitleFont": 20, "SunValleyTitleFont": 28,
+    "SunValleyTitleLargeFont": 40, "SunValleyDisplayFont": 68,
+}
+
+
+def enable_dpi_awareness():
+    """Windows에 "이 프로그램이 화면 배율을 직접 처리한다"고 알려, 창을 흐릿하게 늘려 그리지 않게 함.
+    창이 하나라도 만들어지기 전(tk.Tk() 이전)에 불러야 하며, 이미 설정되어 있거나 지원하지 않는
+    환경이면 조용히 무시함. 시스템 DPI 인식(1)을 쓰므로 프로그램을 켠 뒤 다른 배율의 모니터로 창을
+    옮기면 그 모니터에서는 Windows가 늘려 그림(크기는 맞고 글자만 흐려짐)."""
+    if sys.platform != "win32" or not ENABLE_DPI_AWARENESS:
+        return
+    try:
+        import ctypes
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)  # Windows 8.1 이상
+        except (AttributeError, OSError):
+            ctypes.windll.user32.SetProcessDPIAware()  # 그보다 오래된 Windows
+    except Exception:
+        pass
+
+
+def init_dpi_scale(root):
+    """root 창이 만들어진 뒤 현재 화면 배율을 DPI_SCALE에 기록함 (96 DPI = 1.0, 최소 1.0)"""
+    global DPI_SCALE
+    try:
+        DPI_SCALE = max(1.0, round(float(root.winfo_fpixels("1i")) / 96.0, 2))
+    except (tk.TclError, ValueError):
+        DPI_SCALE = 1.0
+
+
+def px(value):
+    """100% 배율(96 DPI) 기준 픽셀 값을 현재 화면 배율에 맞는 픽셀 값으로 바꿈.
+    글꼴처럼 포인트 단위로 지정한 크기는 Tk가 알아서 키우지만, 칸 크기·간격처럼 픽셀로 지정한
+    값은 자동으로 커지지 않으므로 이 함수를 거쳐야 글자와 균형이 맞음."""
+    return int(round(value * DPI_SCALE))
+
+
+def scale_sv_ttk_fonts():
+    """sv_ttk 글꼴의 크기를 현재 화면 배율에 맞춤 (sv_ttk가 없거나 글꼴이 없으면 무시함).
+    크기를 "기본 픽셀 × 배율"로 매번 새로 정하므로 여러 번 불러도 결과가 같음."""
+    if not sv_ttk:
+        return
+    for name, pixels in SV_TTK_FONT_PIXELS.items():
+        try:
+            font.nametofont(name).configure(size=-max(1, int(round(pixels * DPI_SCALE))))
+        except tk.TclError:
+            pass
+
+
 def normalize_url(raw):
     """스킴이 없는 URL에 https://를 붙여 정규화함 (컬렉션 탭)"""
     raw = raw.strip()
@@ -660,7 +722,11 @@ def merge_parent_lists(existing_parents, incoming_parents, item_fields, item_key
     stats = {"new_parents": 0, "merged_parents": 0, "added": 0, "conflicts": 0, "skipped": 0}
 
     def merge_item(target, item):
-        keys = keys_by_parent.setdefault(id(target), {item_key(x) for x in target["items"]})
+        # setdefault(키, 기본값)은 키가 이미 있어도 기본값을 매번 계산하므로(항목마다 부모 전체의
+        # 비교값을 다시 만들어 항목 수의 제곱만큼 느려짐), 처음 한 번만 만들도록 get으로 확인함
+        keys = keys_by_parent.get(id(target))
+        if keys is None:
+            keys = keys_by_parent[id(target)] = {item_key(x) for x in target["items"]}
         same = item_by_id.get(item["id"])
         if same is not None and item_same(same, item):
             return "skipped"        # 같은 항목이 이미 있음 (다른 폴더로 옮겨 놓은 경우 포함)
@@ -943,6 +1009,7 @@ def apply_custom_styles(content_font):
     라이트/다크를 바꾼 순간 새 테마에는 그 값이 없어 기본값(넓은 버튼 패딩, 기본 글꼴·행 높이)으로
     돌아감. 그래서 sv_ttk.set_theme()을 부른 직후마다, 그리고 글꼴을 바꿀 때마다 이 함수를 불러야 함.
     스타일 이름이 같은 위젯은 설정이 바뀌면 자동으로 다시 그려지므로 위젯을 새로 만들 필요는 없음."""
+    scale_sv_ttk_fonts()  # sv_ttk 글꼴이 화면 배율을 따르도록 (아래 스타일이 이 글꼴을 쓸 수 있음)
     style = ttk.Style()
     style.configure("CalNav.TButton", padding=(2, 4), width=1)
     # 탭이 5개라 800×600(최소 크기)에서도 모두 보이도록 좌우 패딩을 줄임. 탭 하나의 폭은 "글자 폭 +
@@ -950,7 +1017,7 @@ def apply_custom_styles(content_font):
     # 잘려 보이므로 24→6으로 낮춤. 글꼴을 키우거나 탭을 더 늘릴 때는 이 값부터 확인할 것
     style.configure("TopLevel.TNotebook.Tab", font=("맑은 고딕", 13, "bold"), padding=(6, 4))
     style.configure("TopLevel.TNotebook", tabmargins=(6, 8, 6, 0))
-    row_height = max(24, int(content_font[1] * 2.4))
+    row_height = px(max(24, int(content_font[1] * 2.4)))
     for name in ("Checklist.Treeview", "Collection.Treeview", "Search.Treeview", "Trash.Treeview",
                  "Holiday.Treeview"):
         style.configure(name, font=content_font, rowheight=row_height)
@@ -1182,6 +1249,32 @@ def flush_to_disk(f):
         log_message(f"fsync 실패(무시함): {e}")
 
 
+# 저장할 때 임시 파일을 원래 이름으로 교체하다가 PermissionError가 나면, 이 간격(초)만큼 기다렸다가
+# 다시 시도함 (처음 시도 포함 최대 5번, 기다리는 시간은 모두 합쳐 0.75초)
+REPLACE_RETRY_DELAYS = (0.05, 0.1, 0.2, 0.4)
+
+
+def replace_with_retry(src, dst, delays=REPLACE_RETRY_DELAYS):
+    """os.replace(src, dst)를 하되, PermissionError가 나면 delays의 간격으로 기다렸다가 다시 시도함.
+    Windows에서는 백신, 검색 인덱서, 클라우드 동기화(OneDrive 등)가 파일을 잠깐 열고 있는 동안
+    교체가 거부될 수 있는데, 이런 잠금은 보통 잠시 뒤에 풀림. 끝까지 안 되면 마지막 예외를 그대로
+    전달함. 파일 없음 같은 다른 오류는 기다려도 해결되지 않으므로 다시 시도하지 않고 바로 전달함.
+    delays가 비어 있으면 재시도 없이 한 번만 시도함."""
+    for retry, delay in enumerate(delays, start=1):
+        try:
+            os.replace(src, dst)
+            if retry > 1:
+                log_message(f"파일 교체 성공({retry - 1}번 다시 시도함): {os.path.basename(dst)}")
+            return
+        except PermissionError as e:
+            log_message(f"파일 교체 거부됨, {delay}초 뒤 다시 시도({retry}/{len(delays)}): "
+                        f"{os.path.basename(dst)} - {e}")
+            time.sleep(delay)
+    os.replace(src, dst)  # 마지막 시도: 실패하면 예외가 그대로 올라감
+    if delays:
+        log_message(f"파일 교체 성공({len(delays)}번 다시 시도함): {os.path.basename(dst)}")
+
+
 UNTITLED_LABEL = "(제목 없음)"
 
 
@@ -1322,6 +1415,21 @@ class MemoStore:
         self.write_blocked = set()
         # 가장 최근 _atomic_write의 실패 원인(성공하면 None). 저장 실패 팝업에 사유를 보여주는 데 씀
         self.last_write_error = None
+        # 재시도를 끝까지 해도 교체가 거부된 파일의 경로 (_replace_file 참고)
+        self.replace_gave_up = set()
+
+    def _replace_file(self, tmp_path, path):
+        """임시 파일을 path로 교체함 (일시적인 PermissionError는 replace_with_retry가 다시 시도함).
+        직전에 같은 파일의 교체가 재시도 끝에도 거부됐다면 권한 문제처럼 계속되는 문제일 가능성이
+        크므로, 입력할 때마다 화면이 최대 0.75초씩 멈추지 않게 이번에는 재시도 없이 한 번만 시도함.
+        교체에 성공하면 이 기록을 지움."""
+        delays = () if path in self.replace_gave_up else REPLACE_RETRY_DELAYS
+        try:
+            replace_with_retry(tmp_path, path, delays)
+        except PermissionError:
+            self.replace_gave_up.add(path)
+            raise
+        self.replace_gave_up.discard(path)
 
     def _atomic_write(self, path, write_func):
         """write_func(파일객체)로 내용을 쓰되, 같은 폴더의 임시 파일에 먼저 쓴 뒤 os.replace()로
@@ -1340,7 +1448,7 @@ class MemoStore:
             with open(tmp_path, "w", encoding="utf-8") as f:
                 write_func(f)
                 flush_to_disk(f)
-            os.replace(tmp_path, path)
+            self._replace_file(tmp_path, path)
             self.last_write_error = None
         except Exception as e:
             self.last_write_error = e
@@ -1376,7 +1484,7 @@ class MemoStore:
                     for name, text in files.items():
                         zf.writestr(name, text.encode("utf-8"))
                 flush_to_disk(raw)  # 교체 전에 내용을 디스크에 확실히 기록 (_atomic_write 참고)
-            os.replace(tmp_path, path)
+            self._replace_file(tmp_path, path)
         except Exception:
             try:
                 if os.path.exists(tmp_path):
@@ -1430,6 +1538,14 @@ class MemoStore:
                         raise ValueError(f"{base} 파일이 너무 큽니다.")
                     result[base] = zf.read(info).decode("utf-8-sig")
         return result
+
+    def _note_skipped_entries(self, path, counts):
+        """파일을 읽다가 건너뛴 항목이 있으면, 원본을 복사해 두고 시작 후 안내함.
+        건너뛴 항목은 다음 저장 때 파일에서 사라지므로, 복사해 두지 않으면 영영 되찾을 수 없음.
+        counts는 (설명, 개수) 쌍의 목록이며 개수가 0인 것은 안내에서 뺌."""
+        found = [f"{label} {count}개" for label, count in counts if count]
+        if found:
+            self._preserve_original(path, ", ".join(found) + "를 건너뛰었습니다.", move=False)
 
     def _preserve_original(self, path, reason, move=True):
         """읽은 데이터가 원본과 달라질 때(손상으로 빈 데이터로 시작하거나, 일부 항목을 건너뜀) 원본을
@@ -1499,6 +1615,9 @@ class MemoStore:
             return []
         # title/content 키가 없거나 문자열이 아닌 항목이 섞여 있어도 이후 코드가 KeyError로
         # 죽지 않도록 여기서 구조를 정규화함
+        # 메모 형식이 아닌 항목(딕셔너리가 아닌 값)은 건너뛰며, 원본을 복사해 두고 시작 후 안내함
+        self._note_skipped_entries(
+            self.file_path, [("메모 형식이 아닌 항목", sum(1 for m in data if not isinstance(m, dict)))])
         return [{"title": text_or(memo.get("title")), "content": text_or(memo.get("content"))}
                 for memo in data if isinstance(memo, dict)]
 
@@ -1624,6 +1743,7 @@ class MemoStore:
             'font_family': '맑은 고딕',
             'font_size': 12,
             'window_geometry': '800x600+100+100',
+            'window_dpi_scale': 1.0,
             'copy_shortcut': 'Ctrl+Shift+C',
             'theme_mode': 'light',
             'show_holidays_in_list': False
@@ -1649,6 +1769,10 @@ class MemoStore:
             'font_size': pick(config.getint, 'Font', 'size', 'font_size',
                               lambda v: FONT_SIZE_MIN <= v <= FONT_SIZE_MAX),
             'window_geometry': pick(config.get, 'Window', 'geometry', 'window_geometry'),
+            # 창 크기(geometry)를 저장할 때의 화면 배율. 배율이 다른 PC/설정에서 불러온 창 크기를
+            # 현재 배율에 맞게 고치는 데 씀. 없으면 1.0(예전 버전은 배율 개념이 없었음)
+            'window_dpi_scale': pick(config.getfloat, 'Window', 'dpi_scale', 'window_dpi_scale',
+                                     lambda v: 0.5 <= v <= 8.0),
             'copy_shortcut': pick(config.get, 'Shortcuts', 'copy', 'copy_shortcut',
                                   lambda v: v in COPY_SHORTCUT_OPTIONS),
             'theme_mode': pick(config.get, 'Theme', 'mode', 'theme_mode',
@@ -1691,7 +1815,8 @@ class MemoStore:
             'size': str(settings.get('font_size', 12))
         }
         config['Window'] = {
-            'geometry': settings.get('window_geometry', '800x600+100+100')
+            'geometry': settings.get('window_geometry', '800x600+100+100'),
+            'dpi_scale': f"{settings.get('window_dpi_scale', 1.0):.2f}"
         }
         config['Shortcuts'] = {
             'copy': settings.get('copy_shortcut', 'Ctrl+Shift+C')
@@ -1735,13 +1860,18 @@ class MemoStore:
         # 항목/폴더 id가 겹치면 새로 만듦 (직접 편집한 파일 대비)
         seen_parents, seen_items = set(), set()
         cleaned = []
+        bad_parents = bad_lists = bad_items = 0  # 건너뛴 항목 수 (끝에서 원본 보관과 안내에 씀)
         for col in data["collections"]:
             if not isinstance(col, dict):
+                bad_parents += 1
                 continue
             raw_items = col.get("items")
+            if raw_items is not None and not isinstance(raw_items, list):
+                bad_lists += 1  # items가 목록이 아니면 그 쪽의 항목 전체를 읽지 못함
             items = []
             for it in (raw_items if isinstance(raw_items, list) else []):
                 if not isinstance(it, dict):
+                    bad_items += 1
                     continue
                 items.append({
                     "id": unique_id(it.get("id"), seen_items),
@@ -1756,6 +1886,10 @@ class MemoStore:
                 "created": text_or(col.get("created")),
                 "items": items,
             })
+        self._note_skipped_entries(self.collections_file, [
+            ("컬렉션 형식이 아닌 항목", bad_parents),
+            ("항목 목록(items)이 올바르지 않은 컬렉션", bad_lists),
+            ("링크 항목 형식이 아닌 항목", bad_items)])
         return {"collections": cleaned}
 
     def save_collections(self, data):
@@ -1779,13 +1913,18 @@ class MemoStore:
         # 항목/폴더 id가 겹치면 새로 만듦 (직접 편집한 파일 대비)
         seen_parents, seen_items = set(), set()
         cleaned = []
+        bad_parents = bad_lists = bad_items = 0  # 건너뛴 항목 수 (끝에서 원본 보관과 안내에 씀)
         for folder in data["folders"]:
             if not isinstance(folder, dict):
+                bad_parents += 1
                 continue
             raw_items = folder.get("items")
+            if raw_items is not None and not isinstance(raw_items, list):
+                bad_lists += 1  # items가 목록이 아니면 그 쪽의 항목 전체를 읽지 못함
             items = []
             for it in (raw_items if isinstance(raw_items, list) else []):
                 if not isinstance(it, dict):
+                    bad_items += 1
                     continue
                 items.append({
                     "id": unique_id(it.get("id"), seen_items),
@@ -1799,6 +1938,10 @@ class MemoStore:
                 "created": text_or(folder.get("created")),
                 "items": items,
             })
+        self._note_skipped_entries(self.checklists_file, [
+            ("폴더 형식이 아닌 항목", bad_parents),
+            ("항목 목록(items)이 올바르지 않은 폴더", bad_lists),
+            ("체크리스트 항목 형식이 아닌 항목", bad_items)])
         return {"folders": cleaned}
 
     def save_checklists(self, data):
@@ -1870,6 +2013,7 @@ class SettingsManager:
     def save(self):
         """현재 창 크기/위치를 포함해 settings.ini 전체를 저장"""
         self.settings["window_geometry"] = self.app.root.geometry()
+        self.settings["window_dpi_scale"] = DPI_SCALE
         return self.app.store.save_settings(self.settings)
 
     def save_quick_inputs(self):
@@ -1922,7 +2066,7 @@ class SettingsManager:
     def open_font_settings(self):
         settings_win = Toplevel(self.app.root)
         settings_win.title("글꼴 설정")
-        settings_win.geometry("350x150")
+        settings_win.geometry(f"{px(350)}x{px(150)}")
         settings_win.resizable(False, False)
         settings_win.transient(self.app.root)
         settings_win.grab_set()
@@ -1984,7 +2128,7 @@ class SettingsManager:
     def open_shortcut_settings(self):
         settings_win = Toplevel(self.app.root)
         settings_win.title("단축키 설정")
-        settings_win.geometry("350x150")
+        settings_win.geometry(f"{px(350)}x{px(150)}")
         settings_win.resizable(False, False)
         settings_win.transient(self.app.root)
         settings_win.grab_set()
@@ -2024,7 +2168,7 @@ class SettingsManager:
     def open_theme_settings(self):
         settings_win = Toplevel(self.app.root)
         settings_win.title("테마 설정")
-        settings_win.geometry("300x140")
+        settings_win.geometry(f"{px(300)}x{px(140)}")
         settings_win.resizable(False, False)
         settings_win.transient(self.app.root)
         settings_win.grab_set()
@@ -2260,14 +2404,16 @@ class GeneralMemoTab:
         (ttk.PanedWindow는 add()에서 width/minsize를 못 받아 sashpos로 대신 처리)"""
         try:
             self.app.root.update_idletasks()
-            self.main_pane.sashpos(0, 250)
+            self.main_pane.sashpos(0, px(250))
         except Exception:
             pass
-        self.main_pane.bind("<ButtonRelease-1>", lambda e: self.enforce_min_sash(e, self.main_pane, 200))
+        self.main_pane.bind("<ButtonRelease-1>", lambda e: self.enforce_min_sash(e, self.main_pane, px(200)))
 
-    def enforce_min_sash(self, event=None, pane=None, min_width=200):
+    def enforce_min_sash(self, event=None, pane=None, min_width=None):
         """왼쪽 리스트 패널이 너무 좁아지지 않도록 최소 폭을 보정."""
         pane = pane if pane is not None else self.main_pane
+        if min_width is None:
+            min_width = px(200)
         try:
             if pane.sashpos(0) < min_width:
                 pane.sashpos(0, min_width)
@@ -2740,7 +2886,7 @@ class CalendarMemoTab:
         self.calendar_pane = cal_container
 
         # ---- 왼쪽: 달력 (고정 폭: 크기조절 막대로 바꿀 수 없도록 PanedWindow 대신 Frame 사용) ----
-        cal_left = ttk.Frame(cal_container, width=CAL_LEFT_WIDTH)
+        cal_left = ttk.Frame(cal_container, width=px(CAL_LEFT_WIDTH))
         cal_left.pack(side=tk.LEFT, fill=tk.Y)
         cal_left.pack_propagate(False)
 
@@ -2803,9 +2949,9 @@ class CalendarMemoTab:
         # 고정 폭 밖으로 밀려날 수 있어 두 줄로 나눔 - 달력 영역 너비는 그대로 유지)
         m_nav = ttk.Frame(month_tab)
         m_nav.pack(anchor="w", padx=6, pady=(8, 2))
-        m_nav.grid_columnconfigure(0, minsize=30)
+        m_nav.grid_columnconfigure(0, minsize=px(30))
         for c in range(7):
-            m_nav.grid_columnconfigure(c + 1, minsize=CAL_CELL_W + 2)
+            m_nav.grid_columnconfigure(c + 1, minsize=px(CAL_CELL_W) + 2)
 
         nav_controls = ttk.Frame(m_nav)
         nav_controls.grid(row=0, column=1, columnspan=7)
@@ -2824,9 +2970,9 @@ class CalendarMemoTab:
 
         m_nav2 = ttk.Frame(month_tab)
         m_nav2.pack(anchor="w", padx=6, pady=(0, 6))
-        m_nav2.grid_columnconfigure(0, minsize=30)
+        m_nav2.grid_columnconfigure(0, minsize=px(30))
         for c in range(7):
-            m_nav2.grid_columnconfigure(c + 1, minsize=CAL_CELL_W + 2)
+            m_nav2.grid_columnconfigure(c + 1, minsize=px(CAL_CELL_W) + 2)
 
         # "CalNav.TButton" 스타일(좌우 패딩을 줄여 2칸(84px)에 정확히 맞춤)은
         # apply_custom_styles()에서 정의하므로 여기서는 재사용만 함
@@ -2841,13 +2987,13 @@ class CalendarMemoTab:
 
         m_weekday_frame = tk.Frame(month_tab)
         m_weekday_frame.pack(anchor="w", padx=6)
-        m_weekday_frame.grid_columnconfigure(0, minsize=30)
+        m_weekday_frame.grid_columnconfigure(0, minsize=px(30))
         m_corner_lbl = tk.Label(m_weekday_frame, text="", width=3)
         m_corner_lbl.grid(row=0, column=0, sticky="nsew")
         self.weekday_label_widgets.append((m_corner_lbl, "normal"))
         weekday_names = ["일", "월", "화", "수", "목", "금", "토"]
         for i, wd in enumerate(weekday_names):
-            m_weekday_frame.grid_columnconfigure(i + 1, minsize=CAL_CELL_W + 2)
+            m_weekday_frame.grid_columnconfigure(i + 1, minsize=px(CAL_CELL_W) + 2)
             kind = "sun" if i == 0 else ("sat" if i == 6 else "normal")
             lbl = tk.Label(m_weekday_frame, text=wd, width=4, font=("맑은 고딕", 9, "bold"))
             lbl.grid(row=0, column=i + 1, sticky="nsew")
@@ -2876,12 +3022,12 @@ class CalendarMemoTab:
 
         y_weekday_frame = tk.Frame(year_tab)
         y_weekday_frame.pack(fill=tk.X, padx=6)
-        y_weekday_frame.grid_columnconfigure(0, minsize=30)
+        y_weekday_frame.grid_columnconfigure(0, minsize=px(30))
         corner_lbl = tk.Label(y_weekday_frame, text="", width=3)
         corner_lbl.grid(row=0, column=0, sticky="nsew")
         self.weekday_label_widgets.append((corner_lbl, "normal"))
         for i, wd in enumerate(weekday_names):
-            y_weekday_frame.grid_columnconfigure(i + 1, minsize=CAL_CELL_W + 2)
+            y_weekday_frame.grid_columnconfigure(i + 1, minsize=px(CAL_CELL_W) + 2)
             kind = "sun" if i == 0 else ("sat" if i == 6 else "normal")
             lbl = tk.Label(y_weekday_frame, text=wd, width=4, font=("맑은 고딕", 9, "bold"))
             lbl.grid(row=0, column=i + 1, sticky="nsew")
@@ -2893,7 +3039,7 @@ class CalendarMemoTab:
         # sv_ttk 테마의 스크롤바는 매우 얇아서 눈에 잘 안 띄기 때문에, 항상 뚜렷하게 보이는
         # 기본 Tk 스크롤바를 사용해 사용자가 현재 위치를 가늠할 수 있게 함
         self.year_scrollbar = tk.Scrollbar(y_scroll_container, orient="vertical",
-                                            command=self.year_canvas.yview, width=16)
+                                            command=self.year_canvas.yview, width=px(16))
         self.year_canvas.configure(yscrollcommand=self.year_scrollbar.set)
         self.year_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.year_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -3658,9 +3804,9 @@ class CalendarMemoTab:
             widget.destroy()
         self._day_cells[self.month_grid_frame] = {}
         self._month_rendered_day = self._today_str()
-        self.month_grid_frame.grid_columnconfigure(0, minsize=30)
+        self.month_grid_frame.grid_columnconfigure(0, minsize=px(30))
         for c in range(1, 8):
-            self.month_grid_frame.grid_columnconfigure(c, minsize=CAL_CELL_W + 2)
+            self.month_grid_frame.grid_columnconfigure(c, minsize=px(CAL_CELL_W) + 2)
 
         year, month = self.cal_year, self.cal_month
         self.month_year_var.set(str(year))
@@ -3717,9 +3863,9 @@ class CalendarMemoTab:
         self._day_cells[self.year_grid_frame] = {}
         self._year_month_rows = {}
         self._year_rendered_day = self._today_str()
-        self.year_grid_frame.grid_columnconfigure(0, minsize=30)
+        self.year_grid_frame.grid_columnconfigure(0, minsize=px(30))
         for c in range(1, 8):
-            self.year_grid_frame.grid_columnconfigure(c, minsize=CAL_CELL_W + 2)
+            self.year_grid_frame.grid_columnconfigure(c, minsize=px(CAL_CELL_W) + 2)
 
         year = self.cal_year_year
         self.year_year_var.set(str(year))
@@ -3773,7 +3919,7 @@ class CalendarMemoTab:
         colors = THEME_COLORS.get(self.app.settings_mgr.theme_mode, THEME_COLORS["light"])
         has_memo = bool(str(self.calendar_memos.get(date_key, "")).strip())
         cell_bg = colors["has_memo_bg"] if has_memo else colors["bg"]
-        canvas = tk.Canvas(parent, width=CAL_CELL_W, height=CAL_CELL_H,
+        canvas = tk.Canvas(parent, width=px(CAL_CELL_W), height=px(CAL_CELL_H),
                             highlightthickness=0, bg=cell_bg, cursor="hand2")
         canvas.grid(row=row, column=col, sticky="nsew", padx=1, pady=1)
 
@@ -3792,17 +3938,17 @@ class CalendarMemoTab:
         else:
             fg = colors["fg"]
 
-        cx, cy = CAL_CELL_W / 2, CAL_CELL_H / 2 - 2
+        cx, cy = px(CAL_CELL_W) / 2, px(CAL_CELL_H) / 2 - px(2)
         is_today = (date_key == self._today_str())
         is_selected = (date_key == self.selected_date)
 
         if is_today:
-            r = 12
+            r = px(12)
             canvas.create_oval(cx - r, cy - r, cx + r, cy + r, fill=colors["list_select_bg"], outline="")
             fg = colors["list_select_fg"]
         if is_selected:
-            r = 14
-            canvas.create_oval(cx - r, cy - r, cx + r, cy + r, outline=colors["accent"], width=2)
+            r = px(14)
+            canvas.create_oval(cx - r, cy - r, cx + r, cy + r, outline=colors["accent"], width=px(2))
 
         canvas.create_text(cx, cy, text=str(day_num), fill=fg, font=("맑은 고딕", 10))
 
@@ -3898,7 +4044,7 @@ class CalendarMemoTab:
         달력메모(날짜별로 저장되는 메모)에만 적용됨."""
         dialog = Toplevel(self.app.root)
         dialog.title("메모 일괄 삭제")
-        dialog.geometry("380x250")
+        dialog.geometry(f"{px(380)}x{px(250)}")
         dialog.resizable(False, False)
         dialog.transient(self.app.root)
         dialog.grab_set()
@@ -4577,7 +4723,7 @@ class ShortcutHelpDialog(tk.Toplevel):
         outer = ttk.Frame(self, padding=16)
         outer.pack(fill="both", expand=True)
 
-        self._canvas = canvas = tk.Canvas(outer, highlightthickness=0, bg=colors["bg"], yscrollincrement=20)
+        self._canvas = canvas = tk.Canvas(outer, highlightthickness=0, bg=colors["bg"], yscrollincrement=px(20))
         vsb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
         canvas.configure(yscrollcommand=vsb.set)
         vsb.pack(side="right", fill="y")
@@ -4775,8 +4921,8 @@ class ChecklistTab:
         )
         self.items_tree.heading("status", text="상태")
         self.items_tree.heading("content", text="내용")
-        self.items_tree.column("status", width=56, anchor="center", stretch=False)
-        self.items_tree.column("content", width=300, anchor="w", stretch=True)
+        self.items_tree.column("status", width=px(56), anchor="center", stretch=False)
+        self.items_tree.column("content", width=px(300), anchor="w", stretch=True)
 
         items_vsb = ttk.Scrollbar(items_container, orient="vertical", command=self.items_tree.yview)
         self.items_tree.configure(yscrollcommand=items_vsb.set)
@@ -4993,7 +5139,7 @@ class ChecklistTab:
             self._sash_initialized = True
             try:
                 self.app.root.update_idletasks()
-                self.main_pane.sashpos(0, 200)
+                self.main_pane.sashpos(0, px(200))
             except Exception:
                 pass
 
@@ -5007,8 +5153,8 @@ class ChecklistTab:
 
     def _enforce_min_sash(self):
         try:
-            if self.main_pane.sashpos(0) < 200:
-                self.main_pane.sashpos(0, 200)
+            if self.main_pane.sashpos(0) < px(200):
+                self.main_pane.sashpos(0, px(200))
         except Exception:
             pass
 
@@ -5844,9 +5990,9 @@ class CollectionTab:
         self.items_tree.heading("title", text="제목")
         self.items_tree.heading("url", text="URL")
         self.items_tree.heading("memo", text="메모")
-        self.items_tree.column("title", width=180, anchor="w", stretch=True)
-        self.items_tree.column("url", width=200, anchor="w", stretch=True)
-        self.items_tree.column("memo", width=160, anchor="w", stretch=True)
+        self.items_tree.column("title", width=px(180), anchor="w", stretch=True)
+        self.items_tree.column("url", width=px(200), anchor="w", stretch=True)
+        self.items_tree.column("memo", width=px(160), anchor="w", stretch=True)
         self.items_tree.configure(displaycolumns=("title", "memo"))
 
         items_vsb = ttk.Scrollbar(items_container, orient="vertical", command=self.items_tree.yview)
@@ -6095,7 +6241,7 @@ class CollectionTab:
             self._sash_initialized = True
             try:
                 self.app.root.update_idletasks()
-                self.main_pane.sashpos(0, 200)
+                self.main_pane.sashpos(0, px(200))
             except Exception:
                 pass
         if not self._shown_missing_notice and requests is None:
@@ -6117,8 +6263,8 @@ class CollectionTab:
         # 일반메모 탭(GeneralMemoTab.enforce_min_sash)과 같은 값. 추가/제거/▲/▼
         # 버튼 4개의 실제 필요 폭이 두 탭에서 동일(174px)해서 같은 여유(200px)를 둠
         try:
-            if self.main_pane.sashpos(0) < 200:
-                self.main_pane.sashpos(0, 200)
+            if self.main_pane.sashpos(0) < px(200):
+                self.main_pane.sashpos(0, px(200))
         except Exception:
             pass
 
@@ -7156,9 +7302,9 @@ class SearchTab:
         self.tree.heading("kind", text="구분")
         self.tree.heading("where", text="위치")
         self.tree.heading("text", text="내용")
-        self.tree.column("kind", width=120, anchor="w", stretch=False)
-        self.tree.column("where", width=190, anchor="w", stretch=False)
-        self.tree.column("text", width=300, anchor="w", stretch=True)
+        self.tree.column("kind", width=px(120), anchor="w", stretch=False)
+        self.tree.column("where", width=px(190), anchor="w", stretch=False)
+        self.tree.column("text", width=px(300), anchor="w", stretch=True)
         scroll = ttk.Scrollbar(list_frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=scroll.set)
         self.tree.grid(row=0, column=0, sticky="nsew")
@@ -7928,8 +8074,9 @@ class MemoApp:
 
     def __init__(self, root):
         self.root = root
+        init_dpi_scale(root)  # 화면 배율 (px()와 sv_ttk 글꼴 크기가 쓰므로 위젯을 만들기 전에 정함)
         self.root.title("알파카 다이어리 (Alpaca Diary)")
-        self.root.minsize(800, 600)
+        self.root.minsize(px(800), px(600))
         # 아이콘 설정 (오류 발생 시 무시)
         # default=를 지정하면 타이틀바뿐 아니라 작업표시줄 아이콘, 그리고 이후에
         # 열리는 설정/일괄삭제 같은 팝업 창에도 같은 아이콘이 적용됨
@@ -8762,6 +8909,7 @@ class MemoApp:
         def settings_export():
             current = dict(settings_mgr.settings)
             current["window_geometry"] = self.root.geometry()
+            current["window_dpi_scale"] = DPI_SCALE
             return store.settings_to_text(current), "글꼴·테마·단축키 설정"
 
         def settings_summary(data):
@@ -9216,6 +9364,20 @@ class MemoApp:
         apply_titlebar_theme(self.root, self.settings_mgr.theme_mode == "dark")
         self.apply_theme_colors()
 
+    def _geometry_for_current_scale(self, geometry):
+        """저장된 창 크기/위치("800x600+100+100")를 현재 화면 배율에 맞게 고쳐 돌려줌.
+        저장할 때의 배율(settings의 window_dpi_scale)과 지금 배율이 다르면(예: 배율 대응을 켜기
+        전에 저장된 값, 화면 배율을 바꾼 PC) 그 비율만큼 폭/높이/좌표를 곱해, 창이 이전과 같은
+        실제 크기로 열리게 함. 배율이 같으면 값을 그대로 돌려줌."""
+        saved_scale = self.settings_mgr.settings.get("window_dpi_scale", 1.0) or 1.0
+        ratio = DPI_SCALE / saved_scale
+        if abs(ratio - 1.0) < 0.01:
+            return geometry
+        m = re.fullmatch(r"(\d+)x(\d+)([+-]\d+)([+-]\d+)", geometry)
+        width, height = round(int(m.group(1)) * ratio), round(int(m.group(2)) * ratio)
+        x, y = round(int(m.group(3)) * ratio), round(int(m.group(4)) * ratio)
+        return f"{width}x{height}{x:+d}{y:+d}"
+
     def restore_window_geometry(self):
         """창 위치와 크기를 복원"""
         geometry = self.settings_mgr.settings.get("window_geometry", "800x600+100+100")
@@ -9228,14 +9390,14 @@ class MemoApp:
             if geometry and re.fullmatch(r"\d+x\d+[+-]\d+[+-]\d+", geometry):
                 # UI 레이아웃 완료 대기
                 self.root.update_idletasks()
-                self.root.geometry(geometry)
+                self.root.geometry(self._geometry_for_current_scale(geometry))
             else:
                 # 잘못된 형식이면 기본값 사용
                 log_message(f"잘못된 geometry 형식: {geometry}")
-                self.root.geometry("800x600+100+100")
+                self.root.geometry(f"{px(800)}x{px(600)}+{px(100)}+{px(100)}")
         except Exception as e:
             log_message(f"창 위치 복원 실패: {e}")
-            self.root.geometry("800x600+100+100")
+            self.root.geometry(f"{px(800)}x{px(600)}+{px(100)}+{px(100)}")
 
         self.general_tab.restore_layout()
         self.checklist_tab.restore_layout()
@@ -9320,6 +9482,7 @@ class MemoApp:
 
 if __name__ == "__main__":
     set_windows_app_id()  # 반드시 tk.Tk() 생성 전에 호출
+    enable_dpi_awareness()  # 이것도 tk.Tk() 생성 전에 호출 (창이 만들어진 뒤에는 적용되지 않음)
     if not acquire_single_instance(get_app_dir()):
         notice_root = tk.Tk()
         notice_root.withdraw()
